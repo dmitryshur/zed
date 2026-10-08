@@ -192,6 +192,8 @@ impl<D: PickerDelegate> Picker<D> {
             .on_action(cx.listener(Self::editor_move_up))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::select_page_down))
+            .on_action(cx.listener(Self::select_page_up))
             .on_action(cx.listener(Self::select_child))
             .on_action(cx.listener(Self::select_parent))
             .on_action(cx.listener(Self::cancel))

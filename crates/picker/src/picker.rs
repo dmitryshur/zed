@@ -74,6 +74,10 @@ actions!(
         SetPreviewBelow,
         /// Hides the preview.
         SetPreviewHidden,
+        /// Moves the selection down by a page of results.
+        SelectPageDown,
+        /// Moves the selection up by a page of results.
+        SelectPageUp,
         /// Opens the footer's actions menu.
         ToggleActionsMenu,
         /// Toggles multi-select mode, in which clicking items adds them to
@@ -976,6 +980,79 @@ impl<D: PickerDelegate> Picker<D> {
             self.set_selected_index(count - 1, Some(Direction::Up), true, window, cx);
             cx.notify();
         }
+    }
+
+    fn select_page_down(
+        &mut self,
+        _: &SelectPageDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_page(Direction::Down, window, cx);
+    }
+
+    fn select_page_up(&mut self, _: &SelectPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_page(Direction::Up, window, cx);
+    }
+
+    fn select_page(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.delegate.match_count();
+        if count == 0 {
+            return;
+        }
+        let selected = self.delegate.selected_index().min(count - 1);
+        let page = self.rows_per_page();
+        // Search past the target for a selectable row, then back toward the
+        // current selection, so paging stops at either end of the list instead
+        // of wrapping around like `set_selected_index`'s fallback direction.
+        let ix = match direction {
+            Direction::Down => {
+                let target = selected.saturating_add(page).min(count - 1);
+                (target..count)
+                    .chain((selected..target).rev())
+                    .find(|&ix| self.delegate.can_select(ix, window, cx))
+            }
+            Direction::Up => {
+                let target = selected.saturating_sub(page);
+                (0..=target)
+                    .rev()
+                    .chain(target + 1..=selected)
+                    .find(|&ix| self.delegate.can_select(ix, window, cx))
+            }
+        };
+        if let Some(ix) = ix {
+            self.set_selected_index(ix, None, true, window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The number of rows that fit in the list's viewport as of the last layout,
+    /// and at least one.
+    fn rows_per_page(&self) -> usize {
+        let rows = match &self.element_container {
+            ElementContainer::List(state) => {
+                let viewport_bottom = state.viewport_bounds().bottom();
+                (state.logical_scroll_top().item_ix..state.item_count())
+                    .map_while(|ix| state.bounds_for_item(ix))
+                    .take_while(|bounds| bounds.bottom() <= viewport_bottom)
+                    .count()
+            }
+            ElementContainer::UniformList(scroll_handle) => {
+                let item_count = self.delegate.match_count();
+                match scroll_handle.0.borrow().last_item_size {
+                    Some(size) if item_count > 0 => {
+                        let row_height = size.contents.height / item_count as f32;
+                        if row_height > px(0.) {
+                            (size.item.height / row_height) as usize
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                }
+            }
+        };
+        rows.max(1)
     }
 
     pub fn cycle_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1923,6 +2000,76 @@ mod tests {
                 "select_previous should skip non-selectable item at index 1"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_page_navigation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        for uniform in [true, false] {
+            // Every fifth row is a non-selectable header, including the first.
+            let items = (0..60).map(|ix| ix % 5 != 0).collect::<Vec<_>>();
+            let (picker, cx) = cx.add_window_view(|window, cx| {
+                let delegate = TestDelegate::new(items);
+                if uniform {
+                    Picker::uniform_list(delegate, window, cx)
+                } else {
+                    Picker::list(delegate, window, cx)
+                }
+            });
+            picker.update_in(cx, |picker, window, cx| {
+                picker.set_selected_index(1, None, true, window, cx);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+
+            let page = picker.read_with(cx, |picker, _| picker.rows_per_page());
+            assert!(
+                (2..60).contains(&page),
+                "expected a page smaller than the list, got {page} (uniform: {uniform})"
+            );
+
+            picker.update_in(cx, |picker, window, cx| {
+                picker.select_page_down(&SelectPageDown, window, cx);
+            });
+            let expected = if (1 + page) % 5 == 0 {
+                2 + page
+            } else {
+                1 + page
+            };
+            picker.read_with(cx, |picker, _| {
+                assert_eq!(
+                    picker.delegate.selected_index(),
+                    expected,
+                    "page down should move a page, skipping headers (uniform: {uniform})"
+                );
+            });
+
+            for _ in 0..10 {
+                picker.update_in(cx, |picker, window, cx| {
+                    picker.select_page_down(&SelectPageDown, window, cx);
+                });
+            }
+            picker.read_with(cx, |picker, _| {
+                assert_eq!(
+                    picker.delegate.selected_index(),
+                    59,
+                    "page down should stop at the last row (uniform: {uniform})"
+                );
+            });
+
+            for _ in 0..10 {
+                picker.update_in(cx, |picker, window, cx| {
+                    picker.select_page_up(&SelectPageUp, window, cx);
+                });
+            }
+            picker.read_with(cx, |picker, _| {
+                assert_eq!(
+                    picker.delegate.selected_index(),
+                    1,
+                    "page up should stop at the first selectable row (uniform: {uniform})"
+                );
+            });
+        }
     }
 
     #[gpui::test]
