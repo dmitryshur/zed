@@ -179,6 +179,31 @@ impl Addon for CommitDiffAddon {
 
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
 
+/// Keeps the changed files at or under `file_filter` and returns the filter that was applied.
+///
+/// A file history follows renames, so a commit from before a rename doesn't contain the current
+/// path. With `fall_back_to_whole_commit`, the whole commit is kept then instead of showing
+/// nothing. Shallow-boundary diffs must not fall back: they are empty on purpose, and loading
+/// their snapshot would show the entire tree instead of the filtered file.
+fn apply_file_filter(
+    commit_diff: &mut CommitDiff,
+    file_filter: Option<RepoPath>,
+    fall_back_to_whole_commit: bool,
+) -> Option<RepoPath> {
+    let file_filter = file_filter?;
+    let matches_filter = |path: &RepoPath| path.starts_with(&file_filter);
+    if fall_back_to_whole_commit
+        && !commit_diff
+            .files
+            .iter()
+            .any(|file| matches_filter(&file.path))
+    {
+        return None;
+    }
+    commit_diff.files.retain(|file| matches_filter(&file.path));
+    Some(file_filter)
+}
+
 impl CommitView {
     pub fn open(
         commit_sha: String,
@@ -228,10 +253,10 @@ impl CommitView {
                 let mut commit_diff = commit_diff.log_err()?;
                 let commit_details = commit_details.log_err()?;
 
-                // Filter to specific file if requested
-                if let Some(ref filter_path) = file_filter {
-                    commit_diff.files.retain(|f| &f.path == filter_path);
-                }
+                let fall_back_to_whole_commit =
+                    !ignore_shallow_boundary && !commit_diff.is_shallow_boundary;
+                let file_filter =
+                    apply_file_filter(&mut commit_diff, file_filter, fall_back_to_whole_commit);
 
                 let repo = repo.upgrade()?;
 
@@ -1538,6 +1563,68 @@ mod tests {
     use indoc::indoc;
     use language::{Language, LanguageConfig, LanguageMatcher, markdown_lang};
     use settings::SettingsStore;
+
+    #[test]
+    fn test_apply_file_filter() {
+        fn commit_diff(paths: &[&str], is_shallow_boundary: bool) -> CommitDiff {
+            CommitDiff {
+                files: paths
+                    .iter()
+                    .map(|path| project::git_store::CommitFile {
+                        path: RepoPath::new(path).unwrap(),
+                        old_text: None,
+                        new_text: Some(String::new()),
+                        is_binary: false,
+                    })
+                    .collect(),
+                is_shallow_boundary,
+            }
+        }
+        fn paths(commit_diff: &CommitDiff) -> Vec<&str> {
+            commit_diff
+                .files
+                .iter()
+                .map(|file| file.path.as_unix_str())
+                .collect()
+        }
+        let changed_paths = ["src/foo.rs", "src/foobar.rs", "src/foo/mod.rs", "README.md"];
+        let filter = |path: &str| Some(RepoPath::new(path).unwrap());
+
+        let mut diff = commit_diff(&changed_paths, false);
+        assert_eq!(apply_file_filter(&mut diff, None, true), None);
+        assert_eq!(paths(&diff), changed_paths);
+
+        let mut diff = commit_diff(&changed_paths, false);
+        assert_eq!(
+            apply_file_filter(&mut diff, filter("src/foo.rs"), true),
+            filter("src/foo.rs")
+        );
+        assert_eq!(paths(&diff), ["src/foo.rs"]);
+
+        let mut diff = commit_diff(&changed_paths, false);
+        assert_eq!(
+            apply_file_filter(&mut diff, filter("src/foo"), true),
+            filter("src/foo"),
+            "a directory keeps the files under it, but not siblings sharing its name as a prefix"
+        );
+        assert_eq!(paths(&diff), ["src/foo/mod.rs"]);
+
+        let mut diff = commit_diff(&changed_paths, false);
+        assert_eq!(
+            apply_file_filter(&mut diff, filter("src/renamed.rs"), true),
+            None,
+            "a commit that doesn't touch the path falls back to the whole commit"
+        );
+        assert_eq!(paths(&diff), changed_paths);
+
+        let mut diff = commit_diff(&[], true);
+        assert_eq!(
+            apply_file_filter(&mut diff, filter("src/foo.rs"), false),
+            filter("src/foo.rs"),
+            "without the fallback, the filter is kept for a later file snapshot"
+        );
+        assert!(diff.files.is_empty());
+    }
 
     #[gpui::test]
     async fn test_build_buffer_resolves_injected_languages(cx: &mut TestAppContext) {

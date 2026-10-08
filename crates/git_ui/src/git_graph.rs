@@ -2575,10 +2575,19 @@ impl GitGraph {
             repository.downgrade(),
             self.workspace.clone(),
             None,
-            None,
+            self.commit_view_file_filter(),
             window,
             cx,
         );
+    }
+
+    /// A path history opens commits filtered to that path, so a commit that touched many files
+    /// shows only the history's file (or the files under the history's directory).
+    fn commit_view_file_filter(&self) -> Option<RepoPath> {
+        match &self.log_source {
+            LogSource::Path(path) => Some(path.clone()),
+            _ => None,
+        }
     }
 
     fn copy_commit_sha(&mut self, entry_index: usize, cx: &mut Context<Self>) {
@@ -7776,6 +7785,54 @@ mod tests {
                 "Go Back from the commit diff view should return to the Git Graph view"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_path_history_opens_commits_filtered_to_the_path(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "src": { "file.txt": "content" } }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        let file_path = RepoPath::new(&"src/file.txt").unwrap();
+        for (log_source, expected_filter) in [
+            (Some(LogSource::Path(file_path.clone())), Some(file_path)),
+            (None, None),
+        ] {
+            let git_graph = cx.new_window_entity(|window, cx| {
+                GitGraph::new(
+                    repository.read(cx).id,
+                    project.read(cx).git_store().clone(),
+                    workspace.downgrade(),
+                    log_source.clone(),
+                    window,
+                    cx,
+                )
+            });
+            git_graph.read_with(cx, |git_graph, _| {
+                assert_eq!(
+                    git_graph.commit_view_file_filter(),
+                    expected_filter,
+                    "unexpected commit view filter for {log_source:?}"
+                );
+            });
+        }
     }
 
     #[gpui::test]
