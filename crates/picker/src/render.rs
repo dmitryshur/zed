@@ -116,9 +116,11 @@ impl<D: PickerDelegate> Picker<D> {
                     .overflow_hidden()
                     .child(div().flex_1().child(editor.render(window, cx)))
                     .children(self.delegate.searchbar_trailer(window, cx))
-                    .when(self.delegate.supports_multi_select(), |this| {
-                        this.child(self.render_multi_select_toggle(cx))
-                    }),
+                    .when(
+                        self.delegate.supports_multi_select()
+                            && !self.delegate.is_multi_select_persistent(),
+                        |this| this.child(self.render_multi_select_toggle(cx)),
+                    ),
             )
             .when(editor_position == PickerEditorPosition::Start, |this| {
                 this.child(Divider::horizontal())

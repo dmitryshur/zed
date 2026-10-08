@@ -7095,6 +7095,7 @@ dependencies = [
  "ctor",
  "db",
  "editor",
+ "file_content",
  "file_icons",
  "fs",
  "futures 0.3.34",

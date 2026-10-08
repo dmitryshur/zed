@@ -1052,6 +1052,21 @@
     },
   },
   {
+    "context": "GitPanel",
+    "bindings": {
+      "ctrl-3": "git_panel::ActivateCompareTab",
+    },
+  },
+  {
+    "context": "GitPanel && CompareList && !GitBranchSelector && !GitRepositorySelector",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "GitPanel && ChangesList && !GitBranchSelector && !GitRepositorySelector",
     "bindings": {
       "left": "git_panel::CollapseSelectedEntry",

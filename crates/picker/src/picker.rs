@@ -263,6 +263,12 @@ pub trait PickerDelegate: Sized + 'static {
     fn supports_multi_select(&self) -> bool {
         false
     }
+    /// Whether multi-select mode is always on: checkboxes show from the start, clicks toggle
+    /// items, and confirming doesn't leave the mode. For pickers whose purpose is choosing
+    /// several items.
+    fn is_multi_select_persistent(&self) -> bool {
+        false
+    }
     /// Whether the item at `ix` is part of the current multi-selection.
     fn is_item_selected(&self, _ix: usize) -> bool {
         false
@@ -1078,7 +1084,7 @@ impl<D: PickerDelegate> Picker<D> {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.delegate.supports_multi_select() {
+        if !self.delegate.supports_multi_select() || self.delegate.is_multi_select_persistent() {
             cx.propagate();
             return;
         }
@@ -1230,13 +1236,18 @@ impl<D: PickerDelegate> Picker<D> {
             return;
         }
         self.set_selected_index(ix, None, false, window, cx);
-        if self.delegate.supports_multi_select() && (secondary || self.select_instead_of_open) {
+        if self.delegate.supports_multi_select() && (secondary || self.is_multi_select_active()) {
             self.select_instead_of_open = true;
             self.delegate.toggle_item_selected(ix, window, cx);
             cx.notify();
         } else {
             self.do_confirm(secondary, window, cx);
         }
+    }
+
+    fn is_multi_select_active(&self) -> bool {
+        self.delegate.supports_multi_select()
+            && (self.select_instead_of_open || self.delegate.is_multi_select_persistent())
     }
 
     fn do_confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1439,7 +1450,7 @@ impl<D: PickerDelegate> Picker<D> {
 
         let supports_multi_select = self.delegate.supports_multi_select();
         let is_multi_selected = supports_multi_select && self.delegate.is_item_selected(ix);
-        let multi_select_active = supports_multi_select && self.select_instead_of_open;
+        let multi_select_active = self.is_multi_select_active();
 
         let item_with_checkbox = if multi_select_active && selectable {
             let checkbox = self
@@ -1728,6 +1739,7 @@ mod tests {
         confirmations: Vec<(usize, bool)>,
         match_update: Option<(Duration, usize)>,
         supports_multi_select: bool,
+        persistent_multi_select: bool,
         selected_items: Vec<usize>,
         multi_confirmed: Rc<Cell<Option<Vec<usize>>>>,
     }
@@ -1741,6 +1753,7 @@ mod tests {
                 confirmations: Vec::new(),
                 match_update: None,
                 supports_multi_select: false,
+                persistent_multi_select: false,
                 selected_items: Vec::new(),
                 multi_confirmed: Rc::new(Cell::new(None)),
             }
@@ -1748,6 +1761,12 @@ mod tests {
 
         fn with_multi_select(mut self) -> Self {
             self.supports_multi_select = true;
+            self
+        }
+
+        fn with_persistent_multi_select(mut self) -> Self {
+            self.supports_multi_select = true;
+            self.persistent_multi_select = true;
             self
         }
     }
@@ -1821,6 +1840,10 @@ mod tests {
 
         fn supports_multi_select(&self) -> bool {
             self.supports_multi_select
+        }
+
+        fn is_multi_select_persistent(&self) -> bool {
+            self.persistent_multi_select
         }
 
         fn is_item_selected(&self, ix: usize) -> bool {
@@ -2136,6 +2159,57 @@ mod tests {
             Some(1),
             "the mode should be off again after confirming"
         );
+    }
+
+    #[gpui::test]
+    async fn test_persistent_multi_select_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let delegate = TestDelegate::new(vec![true, true, true]).with_persistent_multi_select();
+        let confirmed_index = delegate.confirmed_index.clone();
+        let multi_confirmed = delegate.multi_confirmed.clone();
+        let (picker, cx) =
+            cx.add_window_view(|window, cx| Picker::uniform_list(delegate, window, cx));
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.handle_click(1, false, window, cx);
+        });
+        assert_eq!(
+            confirmed_index.take(),
+            None,
+            "a plain click toggles from the start instead of confirming"
+        );
+        picker.update(cx, |picker, _cx| {
+            assert!(picker.is_multi_select_active());
+            assert!(picker.delegate.is_item_selected(1));
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.toggle_multi_select(&ToggleMultiSelect, window, cx);
+        });
+        picker.update(cx, |picker, _cx| {
+            assert!(
+                picker.is_multi_select_active(),
+                "the mode can't be toggled off"
+            );
+            assert!(picker.delegate.is_item_selected(1));
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.do_confirm(false, window, cx);
+        });
+        assert_eq!(multi_confirmed.take(), Some(vec![1]));
+        picker.update_in(cx, |picker, window, cx| {
+            picker.handle_click(2, false, window, cx);
+        });
+        assert_eq!(
+            confirmed_index.take(),
+            None,
+            "the mode stays on after confirming"
+        );
+        picker.update(cx, |picker, _cx| {
+            assert!(picker.delegate.is_item_selected(2));
+        });
     }
 
     #[gpui::test]

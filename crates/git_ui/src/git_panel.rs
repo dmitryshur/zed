@@ -571,6 +571,7 @@ struct SerializedCommitMessage {
 enum GitPanelTab {
     Changes,
     History,
+    Compare,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1180,6 +1181,7 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     active_tab: GitPanelTab,
+    compare_list: Entity<crate::branch_compare::CompareList>,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
@@ -1517,6 +1519,8 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
+                compare_list: cx
+                    .new(|_| crate::branch_compare::CompareList::new(workspace.weak_handle())),
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
@@ -2073,6 +2077,7 @@ impl GitPanel {
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
+                GitPanelTab::Compare => dispatch_context.add("CompareList"),
             }
         }
 
@@ -2241,6 +2246,11 @@ impl GitPanel {
             self.select_previous_history_entry(cx);
             return;
         }
+        if self.active_tab == GitPanelTab::Compare {
+            self.compare_list
+                .update(cx, |list, cx| list.select_previous(window, cx));
+            return;
+        }
 
         let item_count = self.entries.len();
         if item_count == 0 {
@@ -2318,6 +2328,11 @@ impl GitPanel {
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
             self.select_next_history_entry(cx);
+            return;
+        }
+        if self.active_tab == GitPanelTab::Compare {
+            self.compare_list
+                .update(cx, |list, cx| list.select_next(window, cx));
             return;
         }
 
@@ -2569,6 +2584,11 @@ impl GitPanel {
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
             self.open_selected_history_commit(window, cx);
+            return;
+        }
+        if self.active_tab == GitPanelTab::Compare {
+            self.compare_list
+                .update(cx, |list, cx| list.confirm(window, cx));
             return;
         }
         if self.selection_target_kind() == Some(SelectionTargetKind::Directory)
@@ -7238,11 +7258,24 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
+            ))
+            .child(
+                Divider::vertical()
+                    .color(ui::DividerColor::BorderFaded)
+                    .h_full(),
+            )
+            .child(tab(
+                ElementId::Name("compare-tab".into()),
+                active_tab == GitPanelTab::Compare,
+                false,
+                "Compare".into(),
+                GitPanelTab::Compare,
+                crate::branch_compare::ActivateCompareTab.boxed_clone(),
             ))
     }
 
@@ -7386,6 +7419,52 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    // `select_first`/`select_last` are also called internally for the Changes list, so the
+    // Compare tab handles these actions in listeners of its own.
+    fn select_first_compare_entry(
+        &mut self,
+        _: &menu::SelectFirst,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab != GitPanelTab::Compare {
+            cx.propagate();
+            return;
+        }
+        self.compare_list
+            .update(cx, |list, cx| list.select_first(window, cx));
+    }
+
+    fn select_last_compare_entry(
+        &mut self,
+        _: &menu::SelectLast,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab != GitPanelTab::Compare {
+            cx.propagate();
+            return;
+        }
+        self.compare_list
+            .update(cx, |list, cx| list.select_last(window, cx));
+    }
+
+    pub(crate) fn activate_compare_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_active_tab(GitPanelTab::Compare, window, cx);
+    }
+
+    pub(crate) fn show_comparison(
+        &mut self,
+        comparison: Entity<crate::branch_compare::BranchComparison>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.compare_list.update(cx, |list, cx| {
+            list.set_comparison(Some(comparison), window, cx)
+        });
+        self.set_active_tab(GitPanelTab::Compare, window, cx);
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -7396,7 +7475,7 @@ impl GitPanel {
             GitPanelTab::History => {
                 self.load_commit_history(cx);
             }
-            GitPanelTab::Changes => {
+            GitPanelTab::Changes | GitPanelTab::Compare => {
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
             }
@@ -9364,6 +9443,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::collapse_selected_entry))
             .on_action(cx.listener(Self::expand_selected_entry))
+            .on_action(cx.listener(Self::select_first_compare_entry))
+            .on_action(cx.listener(Self::select_last_compare_entry))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
@@ -9435,6 +9516,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::Compare => this.child(self.compare_list.clone()),
                     })
                     .into_any_element(),
             )

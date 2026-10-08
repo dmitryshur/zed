@@ -47,4 +47,10 @@
       "ctrl-shift-enter": "text_finder::ToggleFoldAll",
     },
   },
+  {
+    "context": "CompareBranchesPicker || (CompareBranchesPicker > Picker > Editor) || (CompareBranchesPicker > Picker > menu)",
+    "bindings": {
+      "tab": "picker::MultiSelectNext",
+    },
+  },
 ]

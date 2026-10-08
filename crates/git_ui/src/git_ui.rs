@@ -36,6 +36,7 @@ use crate::{
     text_diff_view::TextDiffView,
 };
 
+mod branch_compare;
 pub mod branch_diff;
 pub mod branch_picker;
 mod commit_context_menu;
@@ -112,6 +113,7 @@ pub fn init(cx: &mut App) {
         staged_diff::StagedDiff::register(workspace, cx);
         unstaged_diff::UnstagedDiff::register(workspace, cx);
         branch_diff::BranchDiff::register(workspace, cx);
+        branch_compare::register(workspace);
         CommitModal::register(workspace);
         git_panel::register(workspace);
         repository_selector::register(workspace);

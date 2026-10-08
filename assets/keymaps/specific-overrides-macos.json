@@ -51,4 +51,11 @@
       "cmd-l": "pane::SplitRight",
     },
   },
+  {
+    "context": "CompareBranchesPicker || (CompareBranchesPicker > Picker > Editor) || (CompareBranchesPicker > Picker > menu)",
+    "use_key_equivalents": true,
+    "bindings": {
+      "tab": "picker::MultiSelectNext",
+    },
+  },
 ]
