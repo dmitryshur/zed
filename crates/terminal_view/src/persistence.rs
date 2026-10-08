@@ -1,12 +1,11 @@
 use anyhow::Result;
 use async_recursion::async_recursion;
-use collections::HashSet;
 use futures::future::join_all;
 use gpui::{AppContext as _, AsyncWindowContext, Axis, Entity, Task, WeakEntity};
 use project::Project;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use ui::{App, Context, Window};
+use ui::{App, Window};
 use util::ResultExt as _;
 
 use db::{
@@ -15,8 +14,8 @@ use db::{
     sqlez_macros::sql,
 };
 use workspace::{
-    ItemHandle, ItemId, Member, Pane, PaneAxis, PaneGroup, SerializableItem as _, SplitDirection,
-    Workspace, WorkspaceDb, WorkspaceId,
+    ItemId, Member, Pane, PaneAxis, PaneGroup, SerializableItem as _, Workspace, WorkspaceDb,
+    WorkspaceId,
 };
 
 use crate::{
@@ -24,18 +23,34 @@ use crate::{
     terminal_panel::{TerminalPanel, new_terminal_pane},
 };
 
-pub(crate) fn serialize_pane_group(
-    pane_group: &PaneGroup,
-    active_pane: &Entity<Pane>,
-    cx: &mut App,
-) -> SerializedPaneGroup {
-    build_serialized_pane_group(&pane_group.root, active_pane, cx)
+pub(crate) fn serialize_tabs<'a>(
+    tabs: impl Iterator<Item = (&'a PaneGroup, &'a Entity<Pane>)>,
+    active_tab: usize,
+    cx: &App,
+) -> SerializedTabs {
+    let mut serialized_tabs = Vec::new();
+    let mut serialized_active_tab = 0;
+    for (index, (pane_group, active_pane)) in tabs.enumerate() {
+        let serialized_tab = build_serialized_pane_group(&pane_group.root, active_pane, cx);
+        // Task terminals are not serialized, so a tab of only tasks has nothing to restore.
+        if !serialized_tab.has_terminals() {
+            continue;
+        }
+        serialized_tabs.push(serialized_tab);
+        if index <= active_tab {
+            serialized_active_tab = serialized_tabs.len() - 1;
+        }
+    }
+    SerializedTabs {
+        tabs: serialized_tabs,
+        active_tab: serialized_active_tab,
+    }
 }
 
 fn build_serialized_pane_group(
     pane_group: &Member,
     active_pane: &Entity<Pane>,
-    cx: &mut App,
+    cx: &App,
 ) -> SerializedPaneGroup {
     match pane_group {
         Member::Axis(PaneAxis {
@@ -57,8 +72,7 @@ fn build_serialized_pane_group(
     }
 }
 
-fn serialize_pane(pane: &Entity<Pane>, active: bool, cx: &mut App) -> SerializedPane {
-    let mut items_to_serialize = HashSet::default();
+fn serialize_pane(pane: &Entity<Pane>, active: bool, cx: &App) -> SerializedPane {
     let pane = pane.read(cx);
     let children = pane
         .items()
@@ -67,26 +81,20 @@ fn serialize_pane(pane: &Entity<Pane>, active: bool, cx: &mut App) -> Serialized
             if terminal_view.read(cx).terminal().read(cx).task().is_some() {
                 None
             } else {
-                let id = item.item_id().as_u64();
-                items_to_serialize.insert(id);
-                Some(id)
+                Some(item.item_id().as_u64())
             }
         })
         .collect::<Vec<_>>();
-    let active_item = pane
-        .active_item()
-        .map(|item| item.item_id().as_u64())
-        .filter(|active_id| items_to_serialize.contains(active_id));
-
-    let pinned_count = pane.pinned_count();
+    let active_item = children.first().copied();
     SerializedPane {
         active,
         children,
         active_item,
-        pinned_count,
+        pinned_count: 0,
     }
 }
 
+/// Restores the serialized terminal panel and returns the number of restored terminals.
 pub(crate) fn deserialize_terminal_panel(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -97,112 +105,171 @@ pub(crate) fn deserialize_terminal_panel(
     cx: &mut App,
 ) -> Task<anyhow::Result<usize>> {
     window.spawn(cx, async move |cx| {
-        let restored_items = match &serialized_panel.items {
+        let (restored_tabs, active_tab) = match serialized_panel.items {
             SerializedItems::NoSplits(item_ids) => {
-                let items = deserialize_terminal_views(
-                    database_id,
-                    project,
-                    workspace,
-                    item_ids.as_slice(),
-                    cx,
-                )
-                .await;
-                let restored_items = items.len();
-                let active_item = serialized_panel.active_item_id;
-                terminal_panel.update_in(cx, |terminal_panel, window, cx| {
-                    terminal_panel.active_pane.update(cx, |pane, cx| {
-                        populate_pane_items(pane, items, active_item, window, cx);
-                    });
-                })?;
-                restored_items
-            }
-            SerializedItems::WithSplits(serialized_pane_group) => {
-                let center_pane = deserialize_pane_group(
+                let active_index = serialized_panel
+                    .active_item_id
+                    .and_then(|active_id| item_ids.iter().position(|id| *id == active_id));
+                deserialize_legacy_tabs(
                     workspace,
                     project,
                     terminal_panel.clone(),
                     database_id,
-                    serialized_pane_group,
+                    &item_ids,
+                    active_index,
                     cx,
                 )
-                .await;
-                if let Some((center_group, active_pane)) = center_pane {
-                    terminal_panel.update_in(cx, |terminal_panel, window, cx| {
-                        let interim_panes = terminal_panel
-                            .center
-                            .panes()
-                            .into_iter()
-                            .filter(|pane| pane.read(cx).items_len() > 0)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let focused_interim_pane = interim_panes
-                            .iter()
-                            .find(|pane| pane.read(cx).has_focus(window, cx))
-                            .cloned();
-                        terminal_panel.center = PaneGroup::with_root(center_group);
-                        terminal_panel.active_pane =
-                            active_pane.unwrap_or_else(|| terminal_panel.center.first_pane());
-                        let restored_items = terminal_panel
-                            .center
-                            .panes()
-                            .into_iter()
-                            .map(|pane| pane.read(cx).items_len())
-                            .sum::<usize>();
-                        let restored_pane = terminal_panel.active_pane.clone();
-                        for interim_pane in &interim_panes {
-                            terminal_panel.center.split(
-                                &restored_pane,
-                                interim_pane,
-                                SplitDirection::Right,
-                                cx,
-                            );
-                        }
-                        if let Some(focused_interim_pane) = focused_interim_pane {
-                            terminal_panel.active_pane = focused_interim_pane;
-                        }
-                        restored_items
-                    })?
-                } else {
-                    0
+                .await
+            }
+            SerializedItems::WithSplits(serialized_pane_group) => {
+                let mut item_ids = Vec::new();
+                let mut active_index = None;
+                flatten_legacy_pane_group(&serialized_pane_group, &mut item_ids, &mut active_index);
+                deserialize_legacy_tabs(
+                    workspace,
+                    project,
+                    terminal_panel.clone(),
+                    database_id,
+                    &item_ids,
+                    active_index,
+                    cx,
+                )
+                .await
+            }
+            SerializedItems::WithTabs(serialized_tabs) => {
+                let mut restored_tabs = Vec::new();
+                let mut active_tab = 0;
+                for (index, serialized_tab) in serialized_tabs.tabs.iter().enumerate() {
+                    let Some((root, active_pane)) = deserialize_pane_group(
+                        workspace.clone(),
+                        project.clone(),
+                        terminal_panel.clone(),
+                        database_id,
+                        serialized_tab,
+                        false,
+                        cx,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if index == serialized_tabs.active_tab {
+                        active_tab = restored_tabs.len();
+                    }
+                    let pane_group = PaneGroup::with_root(root);
+                    let active_pane = active_pane.unwrap_or_else(|| pane_group.first_pane());
+                    restored_tabs.push((pane_group, active_pane));
                 }
+                (restored_tabs, active_tab)
             }
         };
 
-        Ok(restored_items)
+        terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            terminal_panel.restore_tabs(restored_tabs, active_tab, window, cx)
+        })
     })
 }
 
-fn populate_pane_items(
-    pane: &mut Pane,
-    items: Vec<Entity<TerminalView>>,
-    active_item: Option<u64>,
-    window: &mut Window,
-    cx: &mut Context<Pane>,
+/// Pre-tabs layouts are restored with every terminal in its own tab.
+fn flatten_legacy_pane_group(
+    serialized: &SerializedPaneGroup,
+    item_ids: &mut Vec<u64>,
+    active_index: &mut Option<usize>,
 ) {
-    let interim_active_item = (pane.items_len() > 0).then(|| pane.active_item()).flatten();
-    let mut active_item_index = None;
-    for (item_index, item) in (pane.items_len()..).zip(items) {
-        if Some(item.item_id().as_u64()) == active_item {
-            active_item_index = Some(item_index);
+    match serialized {
+        SerializedPaneGroup::Pane(serialized_pane) => {
+            if serialized_pane.active && !serialized_pane.children.is_empty() {
+                let active_position = serialized_pane
+                    .active_item
+                    .and_then(|active_item| {
+                        serialized_pane
+                            .children
+                            .iter()
+                            .position(|item_id| *item_id == active_item)
+                    })
+                    .unwrap_or(0);
+                *active_index = Some(item_ids.len() + active_position);
+            }
+            item_ids.extend(serialized_pane.children.iter().copied());
         }
-        pane.add_item(Box::new(item), false, false, None, window, cx);
-    }
-    if let Some(interim_active_item) = interim_active_item {
-        if let Some(index) = pane.index_for_item(interim_active_item.as_ref()) {
-            pane.activate_item(index, false, false, window, cx);
+        SerializedPaneGroup::Group { children, .. } => {
+            for child in children {
+                flatten_legacy_pane_group(child, item_ids, active_index);
+            }
         }
-    } else if let Some(index) = active_item_index {
-        pane.activate_item(index, false, false, window, cx);
     }
 }
 
+async fn deserialize_legacy_tabs(
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    terminal_panel: WeakEntity<TerminalPanel>,
+    workspace_id: WorkspaceId,
+    item_ids: &[u64],
+    active_index: Option<usize>,
+    cx: &mut AsyncWindowContext,
+) -> (Vec<(PaneGroup, Entity<Pane>)>, usize) {
+    let terminal_views = deserialize_terminal_views(
+        workspace_id,
+        project.clone(),
+        workspace.clone(),
+        item_ids,
+        cx,
+    )
+    .await;
+    let mut restored_tabs = Vec::new();
+    let mut active_tab = 0;
+    for (index, terminal_view) in terminal_views.into_iter().enumerate() {
+        let Some(terminal_view) = terminal_view else {
+            continue;
+        };
+        let Some(pane) = new_pane_with_terminal(
+            workspace.clone(),
+            project.clone(),
+            terminal_panel.clone(),
+            terminal_view,
+            cx,
+        ) else {
+            continue;
+        };
+        if Some(index) == active_index {
+            active_tab = restored_tabs.len();
+        }
+        restored_tabs.push((PaneGroup::new(pane.clone()), pane));
+    }
+    (restored_tabs, active_tab)
+}
+
+fn new_pane_with_terminal(
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    terminal_panel: WeakEntity<TerminalPanel>,
+    terminal_view: Entity<TerminalView>,
+    cx: &mut AsyncWindowContext,
+) -> Option<Entity<Pane>> {
+    terminal_panel
+        .update_in(cx, |terminal_panel, window, cx| {
+            let zoomed = terminal_panel.active_pane().read(cx).is_zoomed();
+            let pane = new_terminal_pane(workspace, project, zoomed, window, cx);
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(terminal_view), true, false, None, window, cx);
+            });
+            pane
+        })
+        .log_err()
+}
+
+/// Restores one tab's split layout. `in_split` is set for panes that share the tab with
+/// other panes: those get a fresh shell if their terminal can't be restored, so the
+/// layout keeps its shape.
 #[async_recursion(?Send)]
 async fn deserialize_pane_group(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
-    panel: WeakEntity<TerminalPanel>,
+    terminal_panel: WeakEntity<TerminalPanel>,
     workspace_id: WorkspaceId,
     serialized: &SerializedPaneGroup,
+    in_split: bool,
     cx: &mut AsyncWindowContext,
 ) -> Option<(Member, Option<Entity<Pane>>)> {
     match serialized {
@@ -211,15 +278,17 @@ async fn deserialize_pane_group(
             flexes,
             children,
         } => {
+            let children_in_split = in_split || children.len() > 1;
             let mut current_active_pane = None;
             let mut members = Vec::new();
             for child in children {
                 if let Some((new_member, active_pane)) = deserialize_pane_group(
                     workspace.clone(),
                     project.clone(),
-                    panel.clone(),
+                    terminal_panel.clone(),
                     workspace_id,
                     child,
+                    children_in_split,
                     cx,
                 )
                 .await
@@ -243,103 +312,98 @@ async fn deserialize_pane_group(
             ))
         }
         SerializedPaneGroup::Pane(serialized_pane) => {
-            let active = serialized_pane.active;
-
-            let pane = panel
-                .update_in(cx, |terminal_panel, window, cx| {
-                    new_terminal_pane(
-                        workspace.clone(),
-                        project.clone(),
-                        terminal_panel.active_pane.read(cx).is_zoomed(),
-                        window,
-                        cx,
-                    )
-                })
-                .log_err()?;
-            let active_item = serialized_pane.active_item;
-            let pinned_count = serialized_pane.pinned_count;
-            let new_items = deserialize_terminal_views(
-                workspace_id,
-                project.clone(),
-                workspace.clone(),
-                serialized_pane.children.as_slice(),
-                cx,
-            );
-            cx.spawn({
-                let pane = pane.downgrade();
-                async move |cx| {
-                    let new_items = new_items.await;
-
-                    let items = pane.update_in(cx, |pane, window, cx| {
-                        populate_pane_items(pane, new_items, active_item, window, cx);
-                        pane.set_pinned_count(pinned_count.min(pane.items_len()));
-                        pane.items_len()
-                    });
-                    // Avoid blank panes in splits
-                    if items.is_ok_and(|items| items == 0) {
-                        let working_directory = workspace
-                            .update(cx, |workspace, cx| default_working_directory(workspace, cx))
-                            .ok()
-                            .flatten();
-                        let terminal = project
-                            .update(cx, |project, cx| {
-                                project.create_terminal_shell(working_directory, cx)
-                            })
-                            .await
-                            .log_err();
-                        let Some(terminal) = terminal else {
-                            return;
-                        };
-                        pane.update_in(cx, |pane, window, cx| {
-                            let terminal_view = Box::new(cx.new(|cx| {
-                                TerminalView::new(
-                                    terminal,
-                                    workspace.clone(),
-                                    Some(workspace_id),
-                                    project.downgrade(),
-                                    window,
-                                    cx,
-                                )
-                            }));
-                            pane.add_item(terminal_view, true, false, None, window, cx);
-                        })
-                        .ok();
-                    }
+            let restored_view = match serialized_pane.children.first() {
+                Some(item_id) => deserialize_terminal_views(
+                    workspace_id,
+                    project.clone(),
+                    workspace.clone(),
+                    &[*item_id],
+                    cx,
+                )
+                .await
+                .into_iter()
+                .flatten()
+                .next(),
+                None => None,
+            };
+            let terminal_view = match restored_view {
+                Some(terminal_view) => terminal_view,
+                None if in_split => {
+                    new_shell_terminal_view(workspace.clone(), project.clone(), workspace_id, cx)
+                        .await?
                 }
-            })
-            .await;
-            Some((Member::Pane(pane.clone()), active.then_some(pane)))
+                None => return None,
+            };
+            let pane =
+                new_pane_with_terminal(workspace, project, terminal_panel, terminal_view, cx)?;
+            Some((
+                Member::Pane(pane.clone()),
+                serialized_pane.active.then_some(pane),
+            ))
         }
     }
 }
 
+async fn new_shell_terminal_view(
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    workspace_id: WorkspaceId,
+    cx: &mut AsyncWindowContext,
+) -> Option<Entity<TerminalView>> {
+    let working_directory = workspace
+        .update(cx, |workspace, cx| default_working_directory(workspace, cx))
+        .ok()
+        .flatten();
+    let terminal = project
+        .update(cx, |project, cx| {
+            project.create_terminal_shell(working_directory, cx)
+        })
+        .await
+        .log_err()?;
+    cx.update(|window, cx| {
+        cx.new(|cx| {
+            TerminalView::new(
+                terminal,
+                workspace,
+                Some(workspace_id),
+                project.downgrade(),
+                window,
+                cx,
+            )
+        })
+    })
+    .log_err()
+}
+
+/// Returns one entry per item id, `None` where the terminal could not be restored.
 fn deserialize_terminal_views(
     workspace_id: WorkspaceId,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     item_ids: &[u64],
     cx: &mut AsyncWindowContext,
-) -> impl Future<Output = Vec<Entity<TerminalView>>> + use<> {
-    let deserialized_items = join_all(item_ids.iter().filter_map(|item_id| {
-        cx.update(|window, cx| {
-            TerminalView::deserialize(
-                project.clone(),
-                workspace.clone(),
-                workspace_id,
-                *item_id,
-                window,
-                cx,
-            )
+) -> impl Future<Output = Vec<Option<Entity<TerminalView>>>> + use<> {
+    let deserialized_items = item_ids
+        .iter()
+        .map(|item_id| {
+            cx.update(|window, cx| {
+                TerminalView::deserialize(
+                    project.clone(),
+                    workspace.clone(),
+                    workspace_id,
+                    *item_id,
+                    window,
+                    cx,
+                )
+            })
+            .ok()
         })
-        .ok()
-    }));
-    async move {
+        .collect::<Vec<_>>();
+    join_all(
         deserialized_items
-            .await
             .into_iter()
-            .filter_map(|item| item.log_err())
-            .collect()
-    }
+            .map(|item| async move { item?.await.log_err() }),
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -354,7 +418,15 @@ pub(crate) struct SerializedTerminalPanel {
 pub(crate) enum SerializedItems {
     // The data stored before terminal splits were introduced.
     NoSplits(Vec<u64>),
+    // The data stored before each tab got its own split layout.
     WithSplits(SerializedPaneGroup),
+    WithTabs(SerializedTabs),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SerializedTabs {
+    pub tabs: Vec<SerializedPaneGroup>,
+    pub active_tab: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -365,6 +437,17 @@ pub(crate) enum SerializedPaneGroup {
         flexes: Option<Vec<f32>>,
         children: Vec<SerializedPaneGroup>,
     },
+}
+
+impl SerializedPaneGroup {
+    fn has_terminals(&self) -> bool {
+        match self {
+            SerializedPaneGroup::Pane(serialized_pane) => !serialized_pane.children.is_empty(),
+            SerializedPaneGroup::Group { children, .. } => {
+                children.iter().any(SerializedPaneGroup::has_terminals)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
