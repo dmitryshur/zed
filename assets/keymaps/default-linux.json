@@ -1064,6 +1064,8 @@
       "down": "menu::SelectNext",
       "enter": "menu::Confirm",
       "escape": "menu::Cancel",
+      "left": "git_panel::CollapseCompareEntry",
+      "right": "git_panel::ExpandCompareEntry",
     },
   },
   {

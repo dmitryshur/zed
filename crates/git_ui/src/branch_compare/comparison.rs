@@ -576,7 +576,7 @@ pub(crate) mod tests {
     use workspace::MultiWorkspace;
 
     const MAIN_SHA: &str = "1111111111111111111111111111111111111111";
-    const FEATURE_SHA: &str = "2222222222222222222222222222222222222222";
+    pub(crate) const FEATURE_SHA: &str = "2222222222222222222222222222222222222222";
 
     fn repo_path(path: &str) -> RepoPath {
         RepoPath::new(path).unwrap()

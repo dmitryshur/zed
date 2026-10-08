@@ -5,14 +5,16 @@ mod branch_pair_picker;
 mod compare_diff_view;
 mod compare_list;
 mod comparison;
+mod file_tree;
 
 use git::repository::Branch;
-use gpui::{AppContext as _, Context, Window, actions};
+use gpui::{App, AppContext as _, Context, Window, actions};
 use workspace::Workspace;
 
 use crate::git_panel::GitPanel;
 use branch_pair_picker::BranchPairPicker;
 pub(crate) use compare_list::CompareList;
+use compare_list::VerticalDirection;
 pub(crate) use comparison::BranchComparison;
 use comparison::REMOTE_NOT_SUPPORTED;
 
@@ -30,6 +32,18 @@ actions!(
     [
         /// Activates the Compare tab in the git panel.
         ActivateCompareTab,
+        /// Expands the selected folder in the Compare tab, or selects the next row.
+        ExpandCompareEntry,
+        /// Collapses the selected folder or its nearest open parent in the Compare tab.
+        CollapseCompareEntry,
+        /// Scrolls the Compare tab's list down by half a page without changing the selection.
+        ScrollCompareListDown,
+        /// Scrolls the Compare tab's list up by half a page without changing the selection.
+        ScrollCompareListUp,
+        /// Moves the Compare tab's selection down by half a page.
+        SelectCompareHalfPageDown,
+        /// Moves the Compare tab's selection up by half a page.
+        SelectCompareHalfPageUp,
     ]
 );
 
@@ -42,6 +56,46 @@ pub(crate) fn register(workspace: &mut Workspace) {
         workspace.focus_panel::<GitPanel>(window, cx);
         panel.update(cx, |panel, cx| panel.activate_compare_tab(window, cx));
     });
+    workspace.register_action(|workspace, _: &ExpandCompareEntry, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| list.expand_selected(window, cx));
+    });
+    workspace.register_action(|workspace, _: &CollapseCompareEntry, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| list.collapse_selected(window, cx));
+    });
+    workspace.register_action(|workspace, _: &ScrollCompareListDown, _, cx| {
+        update_compare_list(workspace, cx, |list, cx| {
+            list.scroll_half_page(VerticalDirection::Down, cx)
+        });
+    });
+    workspace.register_action(|workspace, _: &ScrollCompareListUp, _, cx| {
+        update_compare_list(workspace, cx, |list, cx| {
+            list.scroll_half_page(VerticalDirection::Up, cx)
+        });
+    });
+    workspace.register_action(|workspace, _: &SelectCompareHalfPageDown, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| {
+            list.select_half_page(VerticalDirection::Down, window, cx)
+        });
+    });
+    workspace.register_action(|workspace, _: &SelectCompareHalfPageUp, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| {
+            list.select_half_page(VerticalDirection::Up, window, cx)
+        });
+    });
+}
+
+/// The Compare tab's actions are only bound while the tab has focus, so they can be handled at
+/// the workspace level.
+fn update_compare_list(
+    workspace: &Workspace,
+    cx: &mut App,
+    update: impl FnOnce(&mut CompareList, &mut Context<CompareList>),
+) {
+    let Some(panel) = workspace.panel::<GitPanel>(cx) else {
+        return;
+    };
+    let compare_list = panel.read(cx).compare_list().clone();
+    compare_list.update(cx, update);
 }
 
 fn compare_branches(

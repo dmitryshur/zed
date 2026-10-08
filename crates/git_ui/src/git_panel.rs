@@ -7449,6 +7449,10 @@ impl GitPanel {
             .update(cx, |list, cx| list.select_last(window, cx));
     }
 
+    pub(crate) fn compare_list(&self) -> &Entity<crate::branch_compare::CompareList> {
+        &self.compare_list
+    }
+
     pub(crate) fn activate_compare_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_active_tab(GitPanelTab::Compare, window, cx);
     }
