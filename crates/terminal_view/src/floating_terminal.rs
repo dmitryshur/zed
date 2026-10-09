@@ -1,9 +1,11 @@
-use gpui::{Action, Entity, EventEmitter, FocusHandle, Focusable, WeakEntity, actions};
+use gpui::{Action, Axis, Entity, EventEmitter, FocusHandle, Focusable, WeakEntity, actions};
 use ui::prelude::*;
 use util::ResultExt;
 use workspace::{FloatingPaneLayer, Item, Pane, Workspace};
 
 use crate::{TerminalView, default_working_directory, terminal_panel::build_terminal_pane};
+
+const KEYBOARD_GEOMETRY_STEP: f32 = 40.;
 
 actions!(
     floating_terminal,
@@ -18,6 +20,28 @@ actions!(
         Previous,
         /// Closes the active floating terminal.
         Close,
+        /// Increases the active floating terminal's width by 40 pixels.
+        IncreaseWidth,
+        /// Decreases the active floating terminal's width by 40 pixels.
+        DecreaseWidth,
+        /// Increases the active floating terminal's height by 40 pixels.
+        IncreaseHeight,
+        /// Decreases the active floating terminal's height by 40 pixels.
+        DecreaseHeight,
+        /// Moves the active floating terminal left by 40 pixels.
+        MoveLeft,
+        /// Moves the active floating terminal down by 40 pixels.
+        MoveDown,
+        /// Moves the active floating terminal up by 40 pixels.
+        MoveUp,
+        /// Moves the active floating terminal right by 40 pixels.
+        MoveRight,
+        /// Restores default sizes and positions for the current floating-terminal layout.
+        ResetPositions,
+        /// Switches between stacked and tiled floating-terminal layouts, retaining each layout's edits.
+        ToggleLayout,
+        /// Toggles the focused floating terminal between 80% size and its previous geometry.
+        ToggleMaximize,
     ]
 );
 
@@ -69,6 +93,61 @@ pub(super) fn init(cx: &mut App) {
                 }
             });
         });
+        workspace.register_action(|_, _: &IncreaseWidth, window, cx| {
+            resize_terminal(Axis::Horizontal, px(KEYBOARD_GEOMETRY_STEP), window, cx);
+        });
+        workspace.register_action(|_, _: &DecreaseWidth, window, cx| {
+            resize_terminal(Axis::Horizontal, px(-KEYBOARD_GEOMETRY_STEP), window, cx);
+        });
+        workspace.register_action(|_, _: &IncreaseHeight, window, cx| {
+            resize_terminal(Axis::Vertical, px(KEYBOARD_GEOMETRY_STEP), window, cx);
+        });
+        workspace.register_action(|_, _: &DecreaseHeight, window, cx| {
+            resize_terminal(Axis::Vertical, px(-KEYBOARD_GEOMETRY_STEP), window, cx);
+        });
+        workspace.register_action(|_, _: &MoveLeft, window, cx| {
+            move_terminal(gpui::point(px(-KEYBOARD_GEOMETRY_STEP), px(0.)), window, cx);
+        });
+        workspace.register_action(|_, _: &MoveDown, window, cx| {
+            move_terminal(gpui::point(px(0.), px(KEYBOARD_GEOMETRY_STEP)), window, cx);
+        });
+        workspace.register_action(|_, _: &MoveUp, window, cx| {
+            move_terminal(gpui::point(px(0.), px(-KEYBOARD_GEOMETRY_STEP)), window, cx);
+        });
+        workspace.register_action(|_, _: &MoveRight, window, cx| {
+            move_terminal(gpui::point(px(KEYBOARD_GEOMETRY_STEP), px(0.)), window, cx);
+        });
+        workspace.register_action(|_, _: &ResetPositions, window, cx| {
+            cx.defer_in(window, |workspace, window, cx| {
+                if !workspace.has_active_modal(window, cx) {
+                    workspace
+                        .floating_panes()
+                        .clone()
+                        .update(cx, |layer, cx| layer.reset_positions(cx));
+                }
+            });
+        });
+        workspace.register_action(|_, _: &ToggleLayout, window, cx| {
+            cx.defer_in(window, |workspace, window, cx| {
+                if !workspace.has_active_modal(window, cx) {
+                    cx.stop_active_drag(window);
+                    workspace
+                        .floating_panes()
+                        .clone()
+                        .update(cx, |layer, cx| layer.toggle_layout(cx));
+                }
+            });
+        });
+        workspace.register_action(|_, _: &ToggleMaximize, window, cx| {
+            cx.defer_in(window, |workspace, window, cx| {
+                if !workspace.has_active_modal(window, cx) {
+                    workspace
+                        .floating_panes()
+                        .clone()
+                        .update(cx, |layer, cx| layer.toggle_maximize(window, cx));
+                }
+            });
+        });
         workspace.register_action(|_, _: &Close, window, cx| {
             cx.defer_in(window, |workspace, window, cx| {
                 if !workspace.has_active_modal(window, cx) {
@@ -83,11 +162,42 @@ pub(super) fn init(cx: &mut App) {
     .detach();
 }
 
-fn new_terminal(workspace: &Workspace, window: &mut Window, cx: &mut App) {
+fn resize_terminal(axis: Axis, amount: Pixels, window: &mut Window, cx: &mut Context<Workspace>) {
+    cx.defer_in(window, move |workspace, window, cx| {
+        if !workspace.has_active_modal(window, cx) {
+            workspace.floating_panes().clone().update(cx, |layer, cx| {
+                layer.resize_active(axis, amount, cx);
+            });
+        }
+    });
+}
+
+fn move_terminal(delta: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Workspace>) {
+    cx.defer_in(window, move |workspace, window, cx| {
+        if !workspace.has_active_modal(window, cx) {
+            workspace
+                .floating_panes()
+                .clone()
+                .update(cx, |layer, cx| layer.move_active(delta, cx));
+        }
+    });
+}
+
+fn new_terminal(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let project = workspace.project().clone();
     let working_directory = default_working_directory(workspace, cx);
     let layer = workspace.floating_panes().clone();
-    let (pane, placeholder) = add_starting_pane(workspace, window, cx);
+    let Some((pane, placeholder)) = add_starting_pane(workspace, window, cx) else {
+        workspace.show_toast(
+            workspace::Toast::new(
+                workspace::notifications::NotificationId::unique::<New>(),
+                "At most four floating terminals can be open in a workspace.",
+            )
+            .autohide(),
+            cx,
+        );
+        return;
+    };
     if !project.read(cx).supports_terminal(cx) {
         placeholder.update(cx, |placeholder, cx| {
             placeholder.error = Some("Terminals are not supported in this project".into());
@@ -126,9 +236,12 @@ fn add_starting_pane(
     workspace: &Workspace,
     window: &mut Window,
     cx: &mut App,
-) -> (Entity<Pane>, Entity<StartingTerminal>) {
-    let project = workspace.project().clone();
+) -> Option<(Entity<Pane>, Entity<StartingTerminal>)> {
     let layer = workspace.floating_panes().clone();
+    if !layer.read(cx).can_add_pane() {
+        return None;
+    }
+    let project = workspace.project().clone();
     let pane = build_terminal_pane(workspace.weak_handle(), project, false, window, cx);
     pane.update(cx, |pane, cx| {
         pane.set_can_toggle_zoom(false, cx);
@@ -141,10 +254,10 @@ fn add_starting_pane(
     pane.update(cx, |pane, cx| {
         pane.add_item(Box::new(placeholder.clone()), true, false, None, window, cx)
     });
-    layer.update(cx, |layer, cx| {
+    let added = layer.update(cx, |layer, cx| {
         layer.add_pane(pane.clone(), New.boxed_clone(), window, cx)
     });
-    (pane, placeholder)
+    added.then_some((pane, placeholder))
 }
 
 fn finish_creation(
@@ -300,7 +413,9 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> (Entity<Pane>, Entity<StartingTerminal>) {
         cx.update(|window, cx| {
-            workspace.update(cx, |workspace, cx| add_starting_pane(workspace, window, cx))
+            workspace.update(cx, |workspace, cx| {
+                add_starting_pane(workspace, window, cx).expect("floating window capacity")
+            })
         })
     }
 
@@ -324,8 +439,24 @@ mod tests {
                 workspace::ActivatePreviousPane,
                 Some("Editor"),
             ),
+            gpui::KeyBinding::new(
+                "super-right",
+                workspace::ActivateNextPane,
+                Some("Terminal && !AgentPanel"),
+            ),
+            gpui::KeyBinding::new("super-right", workspace::ActivateNextPane, Some("Editor")),
             gpui::KeyBinding::new("ctrl-tab", Next, Some(floating_context)),
             gpui::KeyBinding::new("ctrl-shift-tab", Previous, Some(floating_context)),
+            gpui::KeyBinding::new("super-right", IncreaseWidth, Some(floating_context)),
+            gpui::KeyBinding::new("super-left", DecreaseWidth, Some(floating_context)),
+            gpui::KeyBinding::new("super-up", IncreaseHeight, Some(floating_context)),
+            gpui::KeyBinding::new("super-down", DecreaseHeight, Some(floating_context)),
+            gpui::KeyBinding::new("super-shift-h", MoveLeft, Some(floating_context)),
+            gpui::KeyBinding::new("super-shift-j", MoveDown, Some(floating_context)),
+            gpui::KeyBinding::new("super-shift-k", MoveUp, Some(floating_context)),
+            gpui::KeyBinding::new("super-shift-l", MoveRight, Some(floating_context)),
+            gpui::KeyBinding::new("super-[", ToggleLayout, Some(floating_context)),
+            gpui::KeyBinding::new("super-]", ToggleMaximize, Some(floating_context)),
         ]);
         for contexts in [
             vec!["Workspace", "FloatingTerminal", "Pane", "Terminal"],
@@ -339,6 +470,16 @@ mod tests {
             for (keystroke, action) in [
                 ("ctrl-tab", Next.boxed_clone()),
                 ("ctrl-shift-tab", Previous.boxed_clone()),
+                ("super-right", IncreaseWidth.boxed_clone()),
+                ("super-left", DecreaseWidth.boxed_clone()),
+                ("super-up", IncreaseHeight.boxed_clone()),
+                ("super-down", DecreaseHeight.boxed_clone()),
+                ("super-shift-h", MoveLeft.boxed_clone()),
+                ("super-shift-j", MoveDown.boxed_clone()),
+                ("super-shift-k", MoveUp.boxed_clone()),
+                ("super-shift-l", MoveRight.boxed_clone()),
+                ("super-[", ToggleLayout.boxed_clone()),
+                ("super-]", ToggleMaximize.boxed_clone()),
             ] {
                 let (bindings, pending) = keymap.bindings_for_input(
                     &[gpui::Keystroke::parse(keystroke).expect("valid keystroke")],
@@ -365,6 +506,458 @@ mod tests {
                 .first()
                 .is_some_and(|binding| binding.action().partial_eq(&workspace::ActivateNextPane))
         );
+        let (bindings, _) = keymap.bindings_for_input(
+            &[gpui::Keystroke::parse("super-right").expect("valid keystroke")],
+            &contexts,
+        );
+        assert!(
+            bindings
+                .first()
+                .is_some_and(|binding| binding.action().partial_eq(&workspace::ActivateNextPane))
+        );
+    }
+
+    struct TestSearchField {
+        editor: Entity<editor::Editor>,
+    }
+
+    #[gpui::test]
+    async fn floating_terminal_layout_shortcut_retains_geometry_sessions_and_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let (_, workspace, window) = crate::tests::init_test_with_window(cx).await;
+        cx.update(|cx| {
+            let context = "FloatingTerminal || (FloatingTerminal > (Terminal || Editor))";
+            cx.bind_keys([
+                gpui::KeyBinding::new("super-[", ToggleLayout, Some(context)),
+                gpui::KeyBinding::new("super-]", ToggleMaximize, Some(context)),
+                gpui::KeyBinding::new("super-shift-l", MoveRight, Some(context)),
+                gpui::KeyBinding::new("super-shift-h", MoveLeft, Some(context)),
+                gpui::KeyBinding::new("super-k", IncreaseHeight, Some(context)),
+                gpui::KeyBinding::new("super-h", DecreaseWidth, Some(context)),
+            ]);
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let (first, pending_first) = starting_pane(&workspace, &mut cx);
+        let first_terminal = cx.update(|_, cx| display_terminal(cx));
+        complete(&workspace, &first, &pending_first, &first_terminal, &mut cx).await;
+        let (second, pending_second) = starting_pane(&workspace, &mut cx);
+        let second_terminal = cx.update(|_, cx| display_terminal(cx));
+        complete(
+            &workspace,
+            &second,
+            &pending_second,
+            &second_terminal,
+            &mut cx,
+        )
+        .await;
+        cx.simulate_keystrokes("super-shift-l super-k");
+        let stacked = terminal_bounds(&second_terminal, &cx);
+        cx.simulate_keystrokes("super-[");
+        let tiled_default = terminal_bounds(&second_terminal, &cx);
+        assert!(tiled_default.bounds.size.width < stacked.bounds.size.width);
+        assert!(tiled_default.bounds.size.height > stacked.bounds.size.height);
+        let first_default = terminal_bounds(&first_terminal, &cx);
+        assert_eq!(first_default.bounds.size, tiled_default.bounds.size);
+        assert!(first_default.bounds.right() <= tiled_default.bounds.left());
+        cx.simulate_keystrokes("super-shift-h super-h");
+        let tiled = terminal_bounds(&second_terminal, &cx);
+        for _ in 0..3 {
+            cx.simulate_keystrokes("super-[");
+            assert_eq!(terminal_bounds(&second_terminal, &cx), stacked);
+            cx.simulate_keystrokes("super-[");
+            assert_eq!(terminal_bounds(&second_terminal, &cx), tiled);
+            cx.update(|window, cx| assert!(second.read(cx).has_focus(window, cx)));
+        }
+        cx.simulate_keystrokes("super-]");
+        let enlarged = terminal_bounds(&second_terminal, &cx);
+        cx.simulate_keystrokes("super-[");
+        assert_eq!(terminal_bounds(&second_terminal, &cx), stacked);
+        cx.simulate_keystrokes("super-[");
+        assert_eq!(terminal_bounds(&second_terminal, &cx), enlarged);
+        cx.simulate_keystrokes("super-]");
+        assert_eq!(terminal_bounds(&second_terminal, &cx), tiled);
+        cx.dispatch_action(ResetPositions);
+        assert_eq!(terminal_bounds(&second_terminal, &cx), tiled_default);
+        cx.dispatch_action(Toggle);
+        cx.dispatch_action(ToggleLayout);
+        cx.dispatch_action(Toggle);
+        assert_eq!(terminal_bounds(&second_terminal, &cx), stacked);
+        let modal = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| TestModal {
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.active_modal::<TestModal>(cx).unwrap()
+            })
+        });
+        cx.dispatch_action(ToggleLayout);
+        assert_eq!(terminal_bounds(&second_terminal, &cx), stacked);
+        cx.update(|window, cx| assert!(modal.focus_handle(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    async fn floating_terminal_movement_reset_and_maximize_shortcuts(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, workspace, window) = crate::tests::init_test_with_window(cx).await;
+        cx.update(|cx| {
+            let context = "FloatingTerminal || (FloatingTerminal > (Terminal || Editor))";
+            cx.bind_keys([
+                gpui::KeyBinding::new("super-shift-h", MoveLeft, Some(context)),
+                gpui::KeyBinding::new("super-shift-j", MoveDown, Some(context)),
+                gpui::KeyBinding::new("super-shift-k", MoveUp, Some(context)),
+                gpui::KeyBinding::new("super-shift-l", MoveRight, Some(context)),
+                gpui::KeyBinding::new("super-[", ToggleLayout, Some(context)),
+                gpui::KeyBinding::new("super-]", ToggleMaximize, Some(context)),
+                gpui::KeyBinding::new("super-h", DecreaseWidth, Some(context)),
+            ]);
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let layer = workspace.read_with(&cx, |workspace, _| workspace.floating_panes().clone());
+        let (first, pending_first) = starting_pane(&workspace, &mut cx);
+        let first_terminal = cx.update(|_, cx| display_terminal(cx));
+        complete(&workspace, &first, &pending_first, &first_terminal, &mut cx).await;
+        let (second, pending_second) = starting_pane(&workspace, &mut cx);
+        let second_terminal = cx.update(|_, cx| display_terminal(cx));
+        complete(
+            &workspace,
+            &second,
+            &pending_second,
+            &second_terminal,
+            &mut cx,
+        )
+        .await;
+        let first_bounds = terminal_bounds(&first_terminal, &cx);
+        let original = terminal_bounds(&second_terminal, &cx);
+        for (keystroke, delta) in [
+            ("super-shift-h", gpui::point(px(-40.), px(0.))),
+            ("super-shift-j", gpui::point(px(0.), px(40.))),
+            ("super-shift-k", gpui::point(px(0.), px(-40.))),
+            ("super-shift-l", gpui::point(px(40.), px(0.))),
+        ] {
+            let before = terminal_bounds(&second_terminal, &cx);
+            cx.simulate_keystrokes(keystroke);
+            let after = terminal_bounds(&second_terminal, &cx);
+            assert!((after.bounds.origin.x - before.bounds.origin.x - delta.x).abs() < px(0.01));
+            assert!((after.bounds.origin.y - before.bounds.origin.y - delta.y).abs() < px(0.01));
+            assert_eq!(after.bounds.size, before.bounds.size);
+            assert_eq!(terminal_bounds(&first_terminal, &cx), first_bounds);
+            cx.update(|window, cx| assert!(second.read(cx).has_focus(window, cx)));
+        }
+        cx.simulate_keystrokes("super-]");
+        let enlarged = terminal_bounds(&second_terminal, &cx);
+        assert!(enlarged.bounds.size.width > original.bounds.size.width);
+        assert!(enlarged.bounds.size.height > original.bounds.size.height);
+        cx.simulate_keystrokes("super-shift-h super-h");
+        assert_eq!(terminal_bounds(&second_terminal, &cx), enlarged);
+        cx.simulate_keystrokes("super-]");
+        assert_eq!(terminal_bounds(&second_terminal, &cx), original);
+        cx.simulate_keystrokes("super-shift-l super-shift-l super-shift-l");
+        assert!(
+            (terminal_bounds(&second_terminal, &cx).bounds.origin.x
+                - original.bounds.origin.x
+                - px(120.))
+            .abs()
+                < px(0.01)
+        );
+        cx.simulate_keystrokes("super-shift-h super-shift-h super-shift-h");
+        assert_eq!(terminal_bounds(&second_terminal, &cx), original);
+        cx.simulate_keystrokes("super-shift-l super-h super-]");
+        cx.dispatch_action(ResetPositions);
+        assert_eq!(terminal_bounds(&first_terminal, &cx), first_bounds);
+        assert_eq!(terminal_bounds(&second_terminal, &cx), original);
+        cx.update(|_, cx| {
+            assert!(
+                second_terminal
+                    .update(cx, |terminal, _| terminal.take_input_log())
+                    .is_empty()
+            )
+        });
+        let modal = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| TestModal {
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.active_modal::<TestModal>(cx).unwrap()
+            })
+        });
+        for action in [
+            MoveRight.boxed_clone(),
+            ResetPositions.boxed_clone(),
+            ToggleMaximize.boxed_clone(),
+        ] {
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(terminal_bounds(&second_terminal, &cx), original);
+        cx.update(|window, cx| assert!(modal.focus_handle(cx).is_focused(window)));
+        assert_eq!(
+            layer.read_with(&cx, |layer, _| layer.active_pane()),
+            Some(second)
+        );
+    }
+
+    #[gpui::test]
+    async fn floating_terminal_limit_counts_pending_hidden_and_failed_windows(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        cx.executor().allow_parking();
+        cx.update(crate::init);
+        let (_, workspace, window) = crate::tests::init_test_with_window(cx).await;
+        let created = Arc::new(AtomicUsize::new(0));
+        cx.update(|cx| {
+            let created = created.clone();
+            cx.observe_new(move |_: &mut StartingTerminal, _, _| {
+                created.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.terminal.get_or_insert_default().project.shell = Some(
+                        settings::Shell::Program("__nonexistent_floating_limit_shell__".into()),
+                    );
+                });
+            });
+            cx.bind_keys([gpui::KeyBinding::new(
+                "super-n",
+                New,
+                Some("FloatingTerminal"),
+            )]);
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let layer = workspace.read_with(&cx, |workspace, _| workspace.floating_panes().clone());
+        let panes = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let panes = (0..4)
+                    .map(|_| {
+                        add_starting_pane(workspace, window, cx).expect("four available slots")
+                    })
+                    .collect::<Vec<_>>();
+                assert!(add_starting_pane(workspace, window, cx).is_none());
+                panes
+            })
+        });
+        assert_eq!(created.load(Ordering::SeqCst), 4);
+        assert!(!layer.read_with(&cx, |layer, _| layer.can_add_pane()));
+        cx.simulate_keystrokes("super-n super-n super-n");
+        assert_eq!(created.load(Ordering::SeqCst), 4);
+        let button = cx
+            .debug_bounds("ICON-Plus")
+            .expect("floating terminal new button");
+        cx.simulate_click(button.center(), Modifiers::default());
+        assert_eq!(created.load(Ordering::SeqCst), 4);
+        cx.dispatch_action(Toggle);
+        cx.dispatch_action(New);
+        assert_eq!(created.load(Ordering::SeqCst), 4);
+        assert!(!layer.read_with(&cx, |layer, _| layer.is_visible()));
+        cx.dispatch_action(Toggle);
+        cx.dispatch_action(Close);
+        assert!(layer.read_with(&cx, |layer, _| layer.can_add_pane()));
+        let button = cx
+            .debug_bounds("ICON-Plus")
+            .expect("floating terminal new button");
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.condition(&layer, |layer, cx| {
+            layer.active_pane().is_some_and(|pane| {
+                pane.read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<StartingTerminal>())
+                    .is_some_and(|item| item.read(cx).error.is_some())
+            })
+        })
+        .await;
+        assert_eq!(created.load(Ordering::SeqCst), 5);
+        assert!(!layer.read_with(&cx, |layer, _| layer.can_add_pane()));
+        cx.dispatch_action(New);
+        assert_eq!(created.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            panes
+                .iter()
+                .take(3)
+                .filter(|(pane, _)| layer
+                    .read_with(&cx, |layer, _| layer.pane(pane.entity_id()).is_some()))
+                .count(),
+            3
+        );
+    }
+
+    impl EventEmitter<workspace::ToolbarItemEvent> for TestSearchField {}
+
+    impl workspace::ToolbarItemView for TestSearchField {
+        fn set_active_pane_item(
+            &mut self,
+            _: Option<&dyn workspace::ItemHandle>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> workspace::ToolbarItemLocation {
+            workspace::ToolbarItemLocation::PrimaryLeft
+        }
+    }
+
+    impl Render for TestSearchField {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(300.)).h(px(24.)).child(self.editor.clone())
+        }
+    }
+
+    fn terminal_bounds(
+        terminal: &Entity<Terminal>,
+        cx: &VisualTestContext,
+    ) -> terminal::TerminalBounds {
+        terminal.read_with(cx, |terminal, _| terminal.last_content().terminal_bounds)
+    }
+
+    #[gpui::test]
+    async fn floating_terminal_keyboard_resize_keeps_sessions_editor_layout_and_search_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let (_, workspace, window) = crate::tests::init_test_with_window(cx).await;
+        cx.update(|cx| {
+            editor::init(cx);
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("default keymap");
+            cx.bind_keys(bindings);
+            let context = "FloatingTerminal || (FloatingTerminal > (Terminal || Editor))";
+            cx.bind_keys([
+                gpui::KeyBinding::new("super-right", IncreaseWidth, Some(context)),
+                gpui::KeyBinding::new("super-left", DecreaseWidth, Some(context)),
+                gpui::KeyBinding::new("super-up", IncreaseHeight, Some(context)),
+                gpui::KeyBinding::new("super-down", DecreaseHeight, Some(context)),
+            ]);
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.dispatch_action(IncreaseWidth);
+        cx.dispatch_action(DecreaseHeight);
+        let layer = workspace.read_with(&cx, |workspace, _| workspace.floating_panes().clone());
+        assert!(!layer.read_with(&cx, |layer, _| layer.has_panes()));
+        let (first, pending_first) = starting_pane(&workspace, &mut cx);
+        let first_terminal = cx.update(|_, cx| display_terminal(cx));
+        complete(&workspace, &first, &pending_first, &first_terminal, &mut cx).await;
+        let (second, pending_second) = starting_pane(&workspace, &mut cx);
+        let second_terminal = cx.update(|_, cx| display_terminal(cx));
+        complete(
+            &workspace,
+            &second,
+            &pending_second,
+            &second_terminal,
+            &mut cx,
+        )
+        .await;
+        let editor_bounds = workspace.read_with(&cx, |workspace, _| {
+            workspace.bounding_box_for_pane(workspace.active_pane())
+        });
+        let first_bounds = terminal_bounds(&first_terminal, &cx);
+        let second_view = second.read_with(&cx, |pane, _| {
+            pane.active_item()
+                .unwrap()
+                .downcast::<TerminalView>()
+                .unwrap()
+        });
+        for (keystroke, axis, amount) in [
+            ("super-right", Axis::Horizontal, px(40.)),
+            ("super-left", Axis::Horizontal, px(-40.)),
+            ("super-up", Axis::Vertical, px(40.)),
+            ("super-down", Axis::Vertical, px(-40.)),
+        ] {
+            let before = terminal_bounds(&second_terminal, &cx);
+            cx.simulate_keystrokes(keystroke);
+            let after = terminal_bounds(&second_terminal, &cx);
+            match axis {
+                Axis::Horizontal => assert!(
+                    (after.bounds.size.width - before.bounds.size.width - amount).abs() < px(0.01)
+                ),
+                Axis::Vertical => {
+                    let change = after.bounds.size.height - before.bounds.size.height;
+                    assert!((change - amount).abs() <= before.line_height);
+                    assert_eq!(change.signum(), amount.signum());
+                }
+            }
+            cx.update(|window, cx| assert!(second_view.focus_handle(cx).is_focused(window)));
+            assert_eq!(
+                layer.read_with(&cx, |layer, _| layer.active_pane()),
+                Some(second.clone())
+            );
+            assert_eq!(terminal_bounds(&first_terminal, &cx), first_bounds);
+            assert_eq!(
+                workspace.read_with(&cx, |workspace, _| workspace
+                    .bounding_box_for_pane(workspace.active_pane())),
+                editor_bounds
+            );
+        }
+        let before = terminal_bounds(&second_terminal, &cx);
+        cx.simulate_keystrokes("super-right super-right super-right");
+        assert!(
+            (terminal_bounds(&second_terminal, &cx).bounds.size.width
+                - before.bounds.size.width
+                - px(120.))
+            .abs()
+                < px(0.01)
+        );
+        cx.update(|_, cx| {
+            assert!(
+                second_terminal
+                    .update(cx, |terminal, _| terminal.take_input_log())
+                    .is_empty()
+            )
+        });
+        let before = terminal_bounds(&second_terminal, &cx);
+        cx.dispatch_action(Toggle);
+        cx.dispatch_action(IncreaseWidth);
+        cx.dispatch_action(IncreaseHeight);
+        cx.dispatch_action(Toggle);
+        assert_eq!(terminal_bounds(&second_terminal, &cx), before);
+        let search_editor = cx.update(|window, cx| {
+            let editor = cx.new(|cx| editor::Editor::single_line(window, cx));
+            let field = cx.new(|_| TestSearchField {
+                editor: editor.clone(),
+            });
+            second
+                .read(cx)
+                .toolbar()
+                .clone()
+                .update(cx, |toolbar, cx| toolbar.add_item(field, window, cx));
+            editor.focus_handle(cx).focus(window, cx);
+            editor
+        });
+        cx.run_until_parked();
+        let before = terminal_bounds(&second_terminal, &cx);
+        cx.simulate_keystrokes("super-left");
+        assert!(
+            (terminal_bounds(&second_terminal, &cx).bounds.size.width - before.bounds.size.width
+                + px(40.))
+            .abs()
+                < px(0.01)
+        );
+        cx.update(|window, cx| assert!(search_editor.focus_handle(cx).is_focused(window)));
+        let before = terminal_bounds(&second_terminal, &cx);
+        let modal = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| TestModal {
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.active_modal::<TestModal>(cx).unwrap()
+            })
+        });
+        for action in [
+            IncreaseWidth.boxed_clone(),
+            DecreaseWidth.boxed_clone(),
+            IncreaseHeight.boxed_clone(),
+            DecreaseHeight.boxed_clone(),
+        ] {
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(terminal_bounds(&second_terminal, &cx), before);
+        cx.update(|window, cx| assert!(modal.focus_handle(cx).is_focused(window)));
     }
 
     #[gpui::test]
