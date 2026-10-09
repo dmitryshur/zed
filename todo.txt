@@ -1,6 +1,1 @@
-* ctrl-f/ctrl-b scroll list
-* don't auto reveal
-* search and filter
-* floating window terminals
 * inline code review
-* find by ref opens multibuffers with current file not first
