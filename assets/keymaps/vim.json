@@ -1136,6 +1136,7 @@
     "context": "GitPanel && CompareList && !GitBranchSelector && !GitRepositorySelector",
     "use_key_equivalents": true,
     "bindings": {
+      "/": "git_panel::FocusCompareFilter",
       "j": "menu::SelectNext",
       "k": "menu::SelectPrevious",
       "g g": "menu::SelectFirst",

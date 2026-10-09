@@ -32,6 +32,12 @@ actions!(
     [
         /// Activates the Compare tab in the git panel.
         ActivateCompareTab,
+        /// Focuses the file filter in the Compare tab.
+        FocusCompareFilter,
+        /// Returns to the Compare list while keeping its file filter.
+        FinishCompareFilter,
+        /// Clears the Compare tab's file filter and returns to the list.
+        ClearCompareFilter,
         /// Expands the selected folder in the Compare tab, or selects the next row.
         ExpandCompareEntry,
         /// Collapses the selected folder or its nearest open parent in the Compare tab.
@@ -59,6 +65,22 @@ pub(crate) fn register(workspace: &mut Workspace) {
         };
         workspace.focus_panel::<GitPanel>(window, cx);
         panel.update(cx, |panel, cx| panel.activate_compare_tab(window, cx));
+    });
+    workspace.register_action(|workspace, _: &FocusCompareFilter, window, cx| {
+        let Some(panel) = workspace.panel::<GitPanel>(cx) else {
+            return;
+        };
+        workspace.focus_panel::<GitPanel>(window, cx);
+        panel.update(cx, |panel, cx| panel.activate_compare_tab(window, cx));
+        update_compare_list(workspace, cx, |list, cx| list.focus_filter(window, cx));
+    });
+    workspace.register_action(|workspace, _: &FinishCompareFilter, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| list.finish_filter(window, cx));
+        workspace.focus_panel::<GitPanel>(window, cx);
+    });
+    workspace.register_action(|workspace, _: &ClearCompareFilter, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| list.clear_filter(window, cx));
+        workspace.focus_panel::<GitPanel>(window, cx);
     });
     workspace.register_action(|workspace, _: &ExpandCompareEntry, window, cx| {
         update_compare_list(workspace, cx, |list, cx| list.expand_selected(window, cx));

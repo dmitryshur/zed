@@ -2,12 +2,13 @@ use std::{ops::Range, sync::Arc};
 
 use anyhow::Result;
 use collections::HashSet;
-use editor::scroll::ScrollAmount;
+use editor::{Editor, EditorEvent, scroll::ScrollAmount};
 use file_icons::FileIcons;
+use fuzzy_nucleo::{Case, LengthPenalty, StringMatchCandidate};
 use git::{Oid, repository::RepoPath};
 use gpui::{
-    Action as _, AppContext as _, Context, Entity, ScrollStrategy, SharedString, Subscription,
-    Task, UniformListScrollHandle, WeakEntity, Window, point, uniform_list,
+    Action as _, AppContext as _, Context, Entity, Focusable as _, ScrollStrategy, SharedString,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, point, uniform_list,
 };
 use settings::Settings as _;
 use ui::{IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*};
@@ -15,7 +16,7 @@ use util::paths::PathStyle;
 use workspace::Workspace;
 
 use super::{
-    CompareBranches,
+    ClearCompareFilter, CompareBranches,
     compare_diff_view::CompareDiffView,
     comparison::{
         BranchComparison, ComparisonEntry, ComparisonEvent, ComparisonMode, ComparisonState,
@@ -26,6 +27,26 @@ use super::{
 use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
 
 const TREE_INDENT: f32 = 16.0;
+
+fn matching_entry_indices(entries: &[ComparisonEntry], query: &str) -> HashSet<usize> {
+    let candidates = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            StringMatchCandidate::new(index, entry.repo_path.as_unix_str().to_string())
+        })
+        .collect::<Vec<_>>();
+    fuzzy_nucleo::match_strings(
+        &candidates,
+        query,
+        Case::Smart,
+        LengthPenalty::On,
+        entries.len(),
+    )
+    .into_iter()
+    .map(|matched| matched.candidate_id)
+    .collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VerticalDirection {
@@ -60,6 +81,10 @@ pub(crate) struct CompareList {
     entries: Arc<[ComparisonEntry]>,
     rows: Vec<CompareRow>,
     collapsed_directories: HashSet<RepoPath>,
+    filtered_collapsed_directories: HashSet<RepoPath>,
+    filter_editor: Option<Entity<Editor>>,
+    filter_query: String,
+    filter_visible: bool,
     selected_row: Option<usize>,
     initial_file_pending: bool,
     /// The number of rows in the last render, which the page size is measured against.
@@ -70,6 +95,7 @@ pub(crate) struct CompareList {
     shown: Option<ComparedFile>,
     file_load_task: Task<()>,
     _comparison_subscription: Option<Subscription>,
+    _filter_subscriptions: Vec<Subscription>,
 }
 
 impl CompareList {
@@ -80,6 +106,10 @@ impl CompareList {
             entries: Arc::from([]),
             rows: Vec::new(),
             collapsed_directories: HashSet::default(),
+            filtered_collapsed_directories: HashSet::default(),
+            filter_editor: None,
+            filter_query: String::new(),
+            filter_visible: false,
             selected_row: None,
             initial_file_pending: false,
             rendered_row_count: 0,
@@ -89,6 +119,7 @@ impl CompareList {
             shown: None,
             file_load_task: Task::ready(()),
             _comparison_subscription: None,
+            _filter_subscriptions: Vec::new(),
         }
     }
 
@@ -108,6 +139,12 @@ impl CompareList {
         self.entries = Arc::from([]);
         self.rows.clear();
         self.collapsed_directories.clear();
+        self.filtered_collapsed_directories.clear();
+        self.filter_query.clear();
+        self.filter_visible = false;
+        if let Some(editor) = &self.filter_editor {
+            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+        }
         self.selected_row = None;
         self.loading_file = None;
         self.shown = None;
@@ -116,7 +153,112 @@ impl CompareList {
     }
 
     fn rebuild_rows(&mut self) {
-        self.rows = build_rows(&self.entries, &self.collapsed_directories);
+        let visible_entry_indices = self
+            .has_filter()
+            .then(|| matching_entry_indices(&self.entries, &self.filter_query));
+        let collapsed = if self.has_filter() {
+            &self.filtered_collapsed_directories
+        } else {
+            &self.collapsed_directories
+        };
+        self.rows = build_rows(&self.entries, collapsed, visible_entry_indices.as_ref());
+    }
+
+    fn has_filter(&self) -> bool {
+        !self.filter_query.is_empty()
+    }
+
+    pub(crate) fn filter_is_visible(&self) -> bool {
+        self.filter_visible
+    }
+
+    pub(crate) fn filter_is_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.filter_editor
+            .as_ref()
+            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
+    }
+
+    pub(crate) fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = match &self.filter_editor {
+            Some(editor) => editor.clone(),
+            None => {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("Filter files…", window, cx);
+                    editor
+                });
+                self._filter_subscriptions.push(cx.subscribe(
+                    &editor,
+                    |this, editor, event: &EditorEvent, cx| {
+                        if matches!(event, EditorEvent::BufferEdited) {
+                            let query = editor.read(cx).text(cx);
+                            this.update_filter(query, cx);
+                        }
+                    },
+                ));
+                let focus_handle = editor.focus_handle(cx);
+                self._filter_subscriptions.push(cx.on_focus_in(
+                    &focus_handle,
+                    window,
+                    |_, _, cx| cx.notify(),
+                ));
+                self._filter_subscriptions.push(cx.on_focus_out(
+                    &focus_handle,
+                    window,
+                    |_, _, _, cx| cx.notify(),
+                ));
+                self.filter_editor = Some(editor.clone());
+                editor
+            }
+        };
+        self.filter_visible = true;
+        editor.update(cx, |editor, cx| {
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn finish_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_filter() {
+            self.filter_visible = true;
+            cx.notify();
+        } else {
+            self.clear_filter(window, cx);
+        }
+    }
+
+    pub(crate) fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_filter(String::new(), cx);
+        self.filter_visible = false;
+        if let Some(editor) = &self.filter_editor {
+            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+        }
+        cx.notify();
+    }
+
+    fn update_filter(&mut self, query: String, cx: &mut Context<Self>) {
+        let query = query.trim().to_string();
+        if self.filter_query == query {
+            return;
+        }
+        let selected = self.selected_row.and_then(|row| self.row_key(row));
+        self.filter_query = query;
+        self.filtered_collapsed_directories.clear();
+        self.rebuild_rows();
+        self.selected_row = selected
+            .as_ref()
+            .and_then(|key| self.row_index(key))
+            .or_else(|| {
+                self.rows
+                    .iter()
+                    .position(|row| matches!(row, CompareRow::File { .. }))
+            });
+        if let Some(row) = self.selected_row {
+            self.scroll_handle
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        cx.notify();
     }
 
     fn row_key(&self, row_index: usize) -> Option<RowKey> {
@@ -479,8 +621,13 @@ impl CompareList {
 
     /// Collapses or expands a folder and selects it.
     fn toggle_directory(&mut self, path: RepoPath, cx: &mut Context<Self>) {
-        if !self.collapsed_directories.remove(&path) {
-            self.collapsed_directories.insert(path.clone());
+        let collapsed = if self.has_filter() {
+            &mut self.filtered_collapsed_directories
+        } else {
+            &mut self.collapsed_directories
+        };
+        if !collapsed.remove(&path) {
+            collapsed.insert(path.clone());
         }
         self.rebuild_rows();
         self.selected_row = self.row_index(&RowKey::Directory(path));
@@ -673,6 +820,9 @@ impl CompareList {
             }
             ComparisonState::Loaded(_) => {}
         }
+        if self.has_filter() && self.rows.is_empty() {
+            return Self::render_message("No matching files".into());
+        }
         uniform_list(
             "branch-comparison-rows",
             self.rows.len(),
@@ -795,6 +945,26 @@ impl Render for CompareList {
         v_flex()
             .size_full()
             .child(self.render_header(cx))
+            .when(self.filter_visible, |this| {
+                this.children(self.filter_editor.as_ref().map(|editor| {
+                    h_flex()
+                        .h(rems(1.75))
+                        .px_2()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small))
+                        .child(div().flex_1().min_w_0().child(editor.clone()))
+                        .child(
+                            IconButton::new("clear-compare-filter", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Clear Filter"))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(ClearCompareFilter.boxed_clone(), cx);
+                                }),
+                        )
+                }))
+            })
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
     }
 }
@@ -811,8 +981,7 @@ mod tests {
     };
     use editor::{DiffViewStyle, Editor, ScrollBeyondLastLine};
     use gpui::{
-        Focusable as _, KeyBinding, KeyBindingContextPredicate, Modifiers, TestAppContext,
-        VisualTestContext, size,
+        KeyBinding, KeyBindingContextPredicate, Modifiers, TestAppContext, VisualTestContext, size,
     };
     use settings::{KeymapFile, SettingsStore};
     use std::time::Duration;
@@ -835,41 +1004,206 @@ mod tests {
     }
 
     fn bind_compare_keys(cx: &mut VisualTestContext) {
-        let keymap = KeymapFile::parse(include_str!("../../../../assets/keymaps/vim.json"))
-            .expect("Vim keymap should parse");
-        let section = keymap
-            .sections()
-            .find(|section| section.context.contains("CompareList"))
-            .expect("Vim keymap should contain Compare bindings");
-        cx.update(|_, cx| {
-            let context = KeyBindingContextPredicate::parse(&section.context)
-                .expect("Compare context should parse");
-            let bindings = section
-                .bindings()
-                .map(|(keystrokes, action)| {
-                    let (name, input) = KeymapFile::parse_action(action)
-                        .expect("Compare action should parse")
-                        .expect("Compare binding should have an action");
-                    let action = cx
-                        .build_action(name, input.cloned())
-                        .expect("Compare action should be registered");
-                    KeyBinding::load(
-                        keystrokes,
-                        action,
-                        Some(context.clone().into()),
-                        false,
-                        None,
-                        cx.keyboard_mapper().as_ref(),
-                    )
-                    .expect("Compare binding should load")
-                })
-                .collect::<Vec<_>>();
-            cx.bind_keys(bindings);
-        });
+        for source in [
+            include_str!("../../../../assets/keymaps/default-linux.json"),
+            include_str!("../../../../assets/keymaps/vim.json"),
+        ] {
+            let keymap = KeymapFile::parse(source).expect("keymap should parse");
+            for section in keymap.sections().filter(|section| {
+                section.context.starts_with("GitPanel") && section.context.contains("Compare")
+            }) {
+                cx.update(|_, cx| {
+                    let context = KeyBindingContextPredicate::parse(&section.context)
+                        .expect("Compare context should parse");
+                    let bindings = section
+                        .bindings()
+                        .map(|(keystrokes, action)| {
+                            let (name, input) = KeymapFile::parse_action(action)
+                                .expect("Compare action should parse")
+                                .expect("Compare binding should have an action");
+                            let action = cx
+                                .build_action(name, input.cloned())
+                                .expect("Compare action should be registered");
+                            KeyBinding::load(
+                                keystrokes,
+                                action,
+                                Some(context.clone().into()),
+                                false,
+                                None,
+                                cx.keyboard_mapper().as_ref(),
+                            )
+                            .expect("Compare binding should load")
+                        })
+                        .collect::<Vec<_>>();
+                    cx.bind_keys(bindings);
+                });
+            }
+        }
     }
 
     fn editor_scroll_y(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
         editor.update_in(cx, |editor, _, cx| editor.scroll_position(cx).y)
+    }
+
+    #[test]
+    fn test_matching_entry_indices() {
+        let entries = [
+            "README.md",
+            "src/CompareList.rs",
+            "src/compare_diff_view.rs",
+            "crates/editor/src/editor.rs",
+        ]
+        .map(|path| ComparisonEntry {
+            repo_path: RepoPath::new(path).expect("path should be valid"),
+            status: git::status::FileStatus::Untracked,
+            old_side: super::super::comparison::OldSide::Absent,
+        });
+        for (query, expected) in [
+            ("cmp", vec![1, 2]),
+            ("cdv", vec![2]),
+            ("crates/ed", vec![3]),
+            ("ComL", vec![1]),
+            ("SRC", vec![1, 2, 3]),
+            ("missing", vec![]),
+            ("", vec![0, 1, 2, 3]),
+        ] {
+            assert_eq!(
+                matching_entry_indices(&entries, query),
+                expected.into_iter().collect::<HashSet<_>>(),
+                "query: {query}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_compare_filter_keyboard_flow(cx: &mut TestAppContext) {
+        let (project, repository, fs) = setup("main", cx).await;
+        let dot_git = std::path::Path::new(util::path!("/project/.git"));
+        let long_text = (0..200)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+        fs.set_head_for_repo(
+            dot_git,
+            &[
+                ("src/added.rs", long_text),
+                ("src/changed.rs", "fn new() {}\n".into()),
+            ],
+            super::super::comparison::tests::FEATURE_SHA,
+        );
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        bind_compare_keys(cx);
+        let panel = workspace.update_in(cx, GitPanel::new_test);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            start_comparison(
+                workspace,
+                repository.clone(),
+                branch("refs/heads/main"),
+                branch("refs/heads/feature"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+        let view = diff_views(&workspace, cx)
+            .into_iter()
+            .next()
+            .expect("comparison should display a diff");
+        let right_editor =
+            view.read_with(cx, |view, cx| view.editor().read(cx).rhs_editor().clone());
+        let src = RepoPath::new("src").expect("path should be valid");
+        cx.simulate_keystrokes("k h");
+        list.read_with(cx, |list, _| {
+            assert!(list.collapsed_directories.contains(&src));
+            assert_eq!(list.rows.len(), 1);
+        });
+
+        cx.simulate_keystrokes("/");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        assert!(!list.read_with(cx, |list, _| list.filter_is_visible()));
+
+        cx.simulate_keystrokes("/");
+        assert!(cx.update(|window, cx| { list.read(cx).filter_is_focused(window, cx) }));
+        cx.simulate_keystrokes("j k h l /");
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.filter_query, "jkhl/");
+            assert!(list.rows.is_empty());
+            assert_eq!(list.selected_row, None);
+            assert_eq!(list.entries.len(), 3);
+        });
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
+        cx.simulate_keystrokes("enter enter");
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
+        cx.simulate_keystrokes("escape");
+        list.read_with(cx, |list, _| {
+            assert!(!list.has_filter());
+            assert!(!list.filter_visible);
+            assert_eq!(list.rows.len(), 1);
+        });
+
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("src/chg");
+        cx.simulate_keystrokes("enter");
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.filter_query, "src/chg");
+            assert_eq!(list.rows.len(), 2);
+            assert!(list.collapsed_directories.contains(&src));
+            assert!(list.filtered_collapsed_directories.is_empty());
+        });
+        assert!(!cx.update(|window, cx| { list.read(cx).filter_is_focused(window, cx) }));
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
+        cx.simulate_keystrokes("ctrl-f");
+        assert!(editor_scroll_y(&right_editor, cx) > 0.);
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
+
+        cx.dispatch_action(crate::git_panel::ActivateChangesTab);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("/");
+        assert!(!cx.update(|window, cx| { list.read(cx).filter_is_focused(window, cx) }));
+        cx.dispatch_action(super::super::ActivateCompareTab);
+        cx.run_until_parked();
+        assert_eq!(
+            list.read_with(cx, |list, _| list.filter_query.clone()),
+            "src/chg"
+        );
+
+        cx.simulate_keystrokes("h");
+        assert_eq!(list.read_with(cx, |list, _| list.rows.len()), 1);
+        cx.simulate_keystrokes("l j enter");
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
+        assert_eq!(diff_views(&workspace, cx), vec![view.clone()]);
+        assert!(cx.update(|window, cx| { panel.focus_handle(cx).contains_focused(window, cx) }));
+        cx.simulate_keystrokes("escape");
+        list.read_with(cx, |list, _| {
+            assert!(!list.has_filter());
+            assert!(!list.filter_visible);
+            assert!(list.collapsed_directories.contains(&src));
+            assert_eq!(list.rows.len(), 1);
+        });
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("chg");
+        cx.simulate_keystrokes("enter");
+        list.update_in(cx, |list, window, cx| {
+            list.set_comparison(None, window, cx);
+        });
+        cx.run_until_parked();
+        list.read_with(cx, |list, _| {
+            assert!(list.comparison.is_none());
+            assert!(!list.has_filter());
+            assert!(!list.filter_visible);
+            assert!(list.rows.is_empty());
+        });
     }
 
     #[gpui::test]
@@ -902,8 +1236,14 @@ mod tests {
         let right_editor =
             view.read_with(cx, |view, cx| view.editor().read(cx).rhs_editor().clone());
         let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
-        cx.simulate_keystrokes("j");
+        cx.simulate_keystrokes("j /");
+        cx.simulate_input("chg");
+        cx.simulate_keystrokes("enter");
         let assert_selection = |cx: &mut VisualTestContext| {
+            assert_eq!(
+                list.read_with(cx, |list, _| list.filter_query.clone()),
+                "chg"
+            );
             assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
             assert_eq!(
                 list.read_with(cx, |list, _| {
@@ -1015,6 +1355,22 @@ mod tests {
             }),
             Some(other_editor.item_id())
         );
+        workspace.update_in(cx, |workspace, window, cx| {
+            start_comparison(
+                workspace,
+                repository.clone(),
+                branch("refs/heads/main"),
+                branch("refs/heads/feature"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        list.read_with(cx, |list, _| {
+            assert!(!list.has_filter());
+            assert!(!list.filter_visible);
+            assert_eq!(list.entries.len(), 3);
+        });
     }
 
     #[gpui::test]
@@ -1447,10 +1803,15 @@ mod tests {
         cx.simulate_keystrokes("j");
         assert_eq!(list.read_with(cx, |list, _| list.selected_row), Some(3));
         assert_eq!(gate.waiting(), 1, "navigation keeps the confirmed load");
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("deleted");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(gate.waiting(), 1, "filtering keeps the confirmed load");
         gate.open();
         cx.run_until_parked();
         assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
         assert!(panel_has_focus(cx), "confirming keeps focus in the panel");
+        cx.simulate_keystrokes("escape");
 
         let gate = fs.install_blob_read_gate_for_repo(dot_git);
         cx.simulate_keystrokes("g f");

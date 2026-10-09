@@ -1182,6 +1182,7 @@ pub struct GitPanel {
     stash_entries: GitStash,
     active_tab: GitPanelTab,
     compare_list: Entity<crate::branch_compare::CompareList>,
+    _compare_list_subscription: Subscription,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
@@ -1465,6 +1466,10 @@ impl GitPanel {
             )
             .detach();
 
+            let compare_list =
+                cx.new(|_| crate::branch_compare::CompareList::new(workspace.weak_handle()));
+            let compare_list_subscription = cx.observe(&compare_list, |_, _, cx| cx.notify());
+
             let mut this = Self {
                 active_repository,
                 commit_editor,
@@ -1519,8 +1524,8 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
-                compare_list: cx
-                    .new(|_| crate::branch_compare::CompareList::new(workspace.weak_handle())),
+                compare_list,
+                _compare_list_subscription: compare_list_subscription,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
@@ -2068,6 +2073,10 @@ impl GitPanel {
 
         if self.commit_editor.read(cx).is_focused(window) {
             dispatch_context.add("CommitEditor");
+        } else if self.active_tab == GitPanelTab::Compare
+            && self.compare_list.read(cx).filter_is_focused(window, cx)
+        {
+            dispatch_context.add("CompareFilter");
         } else if self.focus_handle.contains_focused(window, cx) || self.context_menu.is_some() {
             // Preserve the panel's list context while a context menu is open.
             // Its focus handle may not appear as a descendant of the panel
@@ -2077,7 +2086,12 @@ impl GitPanel {
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
-                GitPanelTab::Compare => dispatch_context.add("CompareList"),
+                GitPanelTab::Compare => {
+                    dispatch_context.add("CompareList");
+                    if self.compare_list.read(cx).filter_is_visible() {
+                        dispatch_context.add("CompareFiltered");
+                    }
+                }
             }
         }
 

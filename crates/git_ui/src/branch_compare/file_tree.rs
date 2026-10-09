@@ -43,9 +43,13 @@ struct TreeNode {
 pub(super) fn build_rows(
     entries: &[ComparisonEntry],
     collapsed: &HashSet<RepoPath>,
+    visible_entry_indices: Option<&HashSet<usize>>,
 ) -> Vec<CompareRow> {
     let mut root = TreeNode::default();
     for (entry_index, entry) in entries.iter().enumerate() {
+        if visible_entry_indices.is_some_and(|indices| !indices.contains(&entry_index)) {
+            continue;
+        }
         let components = entry.repo_path.components().collect::<Vec<_>>();
         let directories = components
             .split_last()
@@ -170,7 +174,7 @@ mod tests {
             "crates/picker/src/picker.rs",
         ]);
         assert_eq!(
-            render(&build_rows(&entries, &HashSet::default()), &entries),
+            render(&build_rows(&entries, &HashSet::default(), None), &entries),
             [
                 "assets/keymaps/",
                 "  default.json",
@@ -192,7 +196,7 @@ mod tests {
             RepoPath::new("assets/keymaps").unwrap(),
         ]);
         assert_eq!(
-            render(&build_rows(&entries, &collapsed), &entries),
+            render(&build_rows(&entries, &collapsed, None), &entries),
             [
                 "assets/keymaps/ -",
                 "crates/",
@@ -202,5 +206,37 @@ mod tests {
                 "README.md",
             ]
         );
+    }
+
+    #[test]
+    fn test_filtered_rows_keep_original_entry_indices() {
+        let entries = entries(&[
+            "README.md",
+            "assets/keymaps/vim.json",
+            "crates/git_ui/src/branch_compare/comparison.rs",
+            "crates/picker/src/picker.rs",
+        ]);
+        let visible = HashSet::from_iter([2, 3]);
+        let rows = build_rows(&entries, &HashSet::default(), Some(&visible));
+        assert_eq!(
+            render(&rows, &entries),
+            [
+                "crates/",
+                "  git_ui/src/branch_compare/",
+                "    comparison.rs",
+                "  picker/src/",
+                "    picker.rs",
+            ]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter_map(|row| match row {
+                    CompareRow::File { entry_index, .. } => Some(*entry_index),
+                    CompareRow::Directory { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(build_rows(&entries, &HashSet::default(), Some(&HashSet::default())).is_empty());
     }
 }

@@ -1057,12 +1057,28 @@
     "context": "GitPanel && CompareList && !GitBranchSelector && !GitRepositorySelector",
     "use_key_equivalents": true,
     "bindings": {
+      "/": "git_panel::FocusCompareFilter",
       "up": "menu::SelectPrevious",
       "down": "menu::SelectNext",
       "enter": "menu::Confirm",
       "escape": "menu::Cancel",
       "left": "git_panel::CollapseCompareEntry",
       "right": "git_panel::ExpandCompareEntry",
+    },
+  },
+  {
+    "context": "GitPanel && CompareFilter",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "git_panel::FinishCompareFilter",
+      "escape": "git_panel::ClearCompareFilter",
+    },
+  },
+  {
+    "context": "GitPanel && CompareList && CompareFiltered && !GitBranchSelector && !GitRepositorySelector",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "git_panel::ClearCompareFilter",
     },
   },
   {
