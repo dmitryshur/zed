@@ -35228,6 +35228,257 @@ async fn test_find_all_references_preserves_preview_tab(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+async fn test_find_all_references_source_file_first_and_reorders_reused_multibuffer(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            references_provider: Some(lsp::OneOf::Left(true)),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+    cx.set_state(&format!("ˇtarget();\n{}target();\n", "\n".repeat(7)));
+    let source_buffer = cx.multibuffer(|buffer, _| buffer.as_singleton().unwrap());
+    let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+    let root = EditorLspTestContext::root_path();
+    fs.as_fake()
+        .insert_tree(
+            root.join("dir"),
+            json!({
+                "a.rs": "target();\n",
+                "b.rs": "target();\n",
+            }),
+        )
+        .await;
+    let open_buffer = |path: &str, cx: &mut EditorLspTestContext| {
+        cx.update_workspace(|workspace, _, cx| {
+            let project = workspace.project();
+            let path = project
+                .read(cx)
+                .project_path_for_absolute_path(&root.join("dir").join(path), cx)
+                .unwrap();
+            project.update(cx, |project, cx| project.open_buffer(path, cx))
+        })
+    };
+    let first_buffer = open_buffer("a.rs", &mut cx).await.unwrap();
+    let second_buffer = open_buffer("b.rs", &mut cx).await.unwrap();
+    let range = |row| lsp::Range::new(lsp::Position::new(row, 0), lsp::Position::new(row, 6));
+    let locations = vec![
+        lsp::Location {
+            uri: lsp::Uri::from_file_path(root.join("dir/a.rs")).unwrap(),
+            range: range(0),
+        },
+        lsp::Location {
+            uri: cx.buffer_lsp_url.clone(),
+            range: range(8),
+        },
+        lsp::Location {
+            uri: lsp::Uri::from_file_path(root.join("dir/b.rs")).unwrap(),
+            range: range(0),
+        },
+        lsp::Location {
+            uri: cx.buffer_lsp_url.clone(),
+            range: range(0),
+        },
+        lsp::Location {
+            uri: cx.buffer_lsp_url.clone(),
+            range: range(0),
+        },
+    ];
+    cx.lsp
+        .set_request_handler::<lsp::request::References, _, _>(move |_, _| {
+            let locations = locations.clone();
+            async move { Ok(Some(locations)) }
+        });
+    let request_references = |cx: &mut EditorLspTestContext| {
+        cx.update_editor(|editor, window, cx| {
+            editor.find_all_references(&FindAllReferences::default(), window, cx)
+        })
+        .unwrap()
+    };
+    assert_eq!(request_references(&mut cx).await.unwrap(), Navigated::Yes);
+    let results =
+        cx.update_workspace(|workspace, _, cx| workspace.active_item_as::<Editor>(cx).unwrap());
+    let results_buffer = results.read_with(&cx.cx.cx, |editor, _| editor.buffer().clone());
+    let assert_order = |expected: &[Entity<Buffer>], cx: &mut EditorLspTestContext| {
+        results.update_in(&mut cx.cx.cx, |editor, _, cx| {
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            let actual = snapshot
+                .excerpts()
+                .map(|excerpt| excerpt.context.start.buffer_id)
+                .dedup()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .map(|buffer| buffer.read(cx).remote_id())
+                    .collect::<Vec<_>>()
+            );
+            let (_, highlights) = editor
+                .background_highlights
+                .get(&HighlightKey::Editor)
+                .unwrap();
+            assert_eq!(highlights.len(), 4);
+            assert!(
+                highlights
+                    .is_sorted_by(|left, right| left.start.cmp(&right.start, &snapshot).is_le())
+            );
+            for range in highlights.iter() {
+                assert_eq!(
+                    snapshot.text_for_range(range.clone()).collect::<String>(),
+                    "target"
+                );
+            }
+            let (_, cursor) = editor
+                .buffer
+                .read(cx)
+                .text_anchor_for_position(editor.selections.newest_anchor().head(), cx)
+                .unwrap();
+            assert_eq!(cursor.buffer_id, expected[0].read(cx).remote_id());
+        });
+    };
+    assert_order(
+        &[
+            source_buffer.clone(),
+            first_buffer.clone(),
+            second_buffer.clone(),
+        ],
+        &mut cx,
+    );
+    assert_eq!(request_references(&mut cx).await.unwrap(), Navigated::Yes);
+    assert_eq!(
+        cx.update_workspace(|workspace, _, cx| workspace.active_item_as::<Editor>(cx).unwrap()),
+        results
+    );
+    let request = results.update_in(&mut cx.cx.cx, |editor, window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let anchor = snapshot
+            .anchor_in_buffer(first_buffer.read(cx).snapshot().anchor_before(0))
+            .unwrap();
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_anchor_ranges([anchor..anchor])
+        });
+        editor
+            .find_all_references(&FindAllReferences::default(), window, cx)
+            .unwrap()
+    });
+    assert_eq!(request.await.unwrap(), Navigated::Yes);
+    assert_eq!(
+        cx.update_workspace(|workspace, _, cx| workspace.active_item_as::<Editor>(cx).unwrap()),
+        results
+    );
+    assert_eq!(
+        results.read_with(&cx.cx.cx, |editor, _| editor.buffer().clone()),
+        results_buffer
+    );
+    assert_order(&[first_buffer, second_buffer, source_buffer], &mut cx);
+}
+
+#[gpui::test]
+async fn test_reference_multibuffer_reordering_preserves_edits_with_duplicate_paths(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/one"), json!({ "file.rs": "target();\n" }))
+        .await;
+    fs.insert_tree(path!("/two"), json!({ "file.rs": "target();\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/one").as_ref(), path!("/two").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+    let mut buffers = Vec::new();
+    for path in [path!("/one/file.rs"), path!("/two/file.rs")] {
+        let task = project.update(cx, |project, cx| {
+            let path = project
+                .project_path_for_absolute_path(path.as_ref(), cx)
+                .unwrap();
+            project.open_buffer(path, cx)
+        });
+        buffers.push(task.await.unwrap());
+    }
+    let locations = buffers
+        .iter()
+        .map(|buffer| (buffer.clone(), vec![Point::new(0, 0)..Point::new(0, 6)]))
+        .collect::<std::collections::HashMap<_, _>>();
+    let open_results = |preferred_buffer, cx: &mut VisualTestContext| {
+        workspace.update_in(cx, |workspace, window, cx| {
+            Editor::open_locations_in_multibuffer(
+                workspace,
+                locations.clone(),
+                preferred_buffer,
+                "References to target".to_string(),
+                false,
+                false,
+                MultibufferSelectionMode::First,
+                window,
+                cx,
+            )
+            .unwrap()
+            .0
+        })
+    };
+    let first_id = buffers[0].read_with(cx, |buffer, _| buffer.remote_id());
+    let second_id = buffers[1].read_with(cx, |buffer, _| buffer.remote_id());
+    let results = open_results(Some(first_id), cx);
+    results.update_in(cx, |editor, window, cx| {
+        let source = buffers[0].read(cx).snapshot();
+        let anchor = editor
+            .buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_buffer(source.anchor_before(source.len()))
+            .unwrap();
+        editor.transact(window, cx, |editor, _, cx| {
+            editor.edit([(anchor..anchor, "// unsaved")], cx)
+        });
+    });
+    for (preferred_buffer, expected) in [
+        (Some(second_id), [second_id, first_id]),
+        (Some(first_id), [first_id, second_id]),
+        (None, [first_id, second_id]),
+    ] {
+        let reopened = open_results(preferred_buffer, cx);
+        assert_eq!(reopened, results);
+        results.read_with(cx, |editor, cx| {
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            assert_eq!(
+                snapshot
+                    .excerpts()
+                    .map(|excerpt| excerpt.context.start.buffer_id)
+                    .dedup()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(editor.buffer.read(cx).all_buffers().len(), 2);
+        });
+        assert_eq!(
+            buffers[0].read_with(cx, |buffer, _| buffer.text()),
+            "target();\n// unsaved"
+        );
+    }
+    let absent = cx.new(|cx| Buffer::local("", cx));
+    assert_eq!(
+        open_results(
+            Some(absent.read_with(cx, |buffer, _| buffer.remote_id())),
+            cx
+        ),
+        results
+    );
+    results.update_in(cx, |editor, window, cx| editor.undo(&Undo, window, cx));
+    assert_eq!(
+        buffers[0].read_with(cx, |buffer, _| buffer.text()),
+        "target();\n"
+    );
+    assert!(!buffers[0].read_with(cx, |buffer, _| buffer.is_dirty()));
+}
+
+#[gpui::test]
 async fn test_find_enclosing_node_with_task(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

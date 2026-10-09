@@ -1528,6 +1528,7 @@ impl Editor {
                 Self::open_locations_in_multibuffer(
                     workspace,
                     locations,
+                    Some(buffer.read(cx).remote_id()),
                     title,
                     false,
                     allow_preview,
@@ -1819,6 +1820,7 @@ impl Editor {
                             Self::open_locations_in_multibuffer(
                                 workspace,
                                 locations,
+                                None,
                                 title,
                                 split,
                                 allow_preview,
@@ -2191,6 +2193,7 @@ impl Editor {
     pub(super) fn open_locations_in_multibuffer(
         workspace: &mut Workspace,
         locations: std::collections::HashMap<Entity<Buffer>, Vec<Range<Point>>>,
+        preferred_buffer: Option<BufferId>,
         title: String,
         split: bool,
         allow_preview: bool,
@@ -2204,41 +2207,19 @@ impl Editor {
         }
 
         let capability = workspace.project().read(cx).capability();
-        let mut ranges = <Vec<Range<Anchor>>>::new();
-
-        // a key to find existing multibuffer editors with the same set of locations
-        // to prevent us from opening more and more multibuffer tabs for searches and the like
-        let mut key = (title.clone(), vec![]);
-        let excerpt_buffer = cx.new(|cx| {
-            let key = &mut key.1;
-            let mut multibuffer = MultiBuffer::new(capability);
-            let mut sorted_locations = locations.into_iter().collect::<Vec<_>>();
-            sorted_locations.sort_by_key(|(buffer, _)| buffer.read(cx).remote_id());
-            for (buffer, mut ranges_for_buffer) in sorted_locations {
-                ranges_for_buffer.sort_by_key(|range| (range.start, Reverse(range.end)));
-                key.push((buffer.read(cx).remote_id(), ranges_for_buffer.clone()));
-                multibuffer.set_excerpts_for_path(
-                    PathKey::for_buffer(&buffer, cx),
-                    buffer.clone(),
-                    ranges_for_buffer.clone(),
-                    multibuffer_context_lines(cx),
-                    cx,
-                );
-                let snapshot = multibuffer.snapshot(cx);
-                let buffer_snapshot = buffer.read(cx).snapshot();
-                ranges.extend(ranges_for_buffer.into_iter().filter_map(|range| {
-                    let text_range = buffer_snapshot.anchor_range_inside(range);
-                    let start = snapshot.anchor_in_buffer(text_range.start)?;
-                    let end = snapshot.anchor_in_buffer(text_range.end)?;
-                    Some(start..end)
-                }))
-            }
-
-            let final_snapshot = multibuffer.snapshot(cx);
-            ranges.sort_by(|a, b| a.start.cmp(&b.start, &final_snapshot));
-
-            multibuffer.with_title(title)
-        });
+        let mut sorted_locations = locations.into_iter().collect::<Vec<_>>();
+        sorted_locations.sort_by_key(|(buffer, _)| buffer.read(cx).remote_id());
+        for (_, ranges) in &mut sorted_locations {
+            ranges.sort_by_key(|range| (range.start, Reverse(range.end)));
+        }
+        // The same results should reuse their tab even when invoked from a different file.
+        let key = (
+            title.clone(),
+            sorted_locations
+                .iter()
+                .map(|(buffer, ranges)| (buffer.read(cx).remote_id(), ranges.clone()))
+                .collect::<Vec<_>>(),
+        );
         let existing = workspace.active_pane().update(cx, |pane, cx| {
             pane.items()
                 .filter_map(|item| item.downcast::<Editor>())
@@ -2254,6 +2235,77 @@ impl Editor {
                 })
         });
         let was_existing = existing.is_some();
+        let prioritize_buffer = preferred_buffer.is_some_and(|preferred_buffer| {
+            sorted_locations
+                .iter()
+                .any(|(buffer, _)| buffer.read(cx).remote_id() == preferred_buffer)
+        });
+        if prioritize_buffer {
+            sorted_locations.sort_by_cached_key(|(buffer, _)| {
+                (
+                    Some(buffer.read(cx).remote_id()) != preferred_buffer,
+                    PathKey::for_buffer(buffer, cx),
+                )
+            });
+        }
+        let locations = sorted_locations
+            .into_iter()
+            .enumerate()
+            .map(|(index, (buffer, ranges))| {
+                let mut path = PathKey::for_buffer(&buffer, cx);
+                if prioritize_buffer {
+                    path.sort_prefix = Some(index as u64);
+                }
+                (path, buffer, ranges)
+            })
+            .collect::<Vec<_>>();
+        let excerpt_buffer = existing
+            .as_ref()
+            .map(|editor| editor.read(cx).buffer.clone())
+            .unwrap_or_else(|| cx.new(|_| MultiBuffer::new(capability).with_title(title)));
+        let ranges = excerpt_buffer.update(cx, |multibuffer, cx| {
+            let snapshot = multibuffer.snapshot(cx);
+            let mut obsolete_paths = locations
+                .iter()
+                .filter_map(|(path, buffer, _)| {
+                    let old_path = snapshot.path_for_buffer(buffer.read(cx).remote_id())?;
+                    (old_path != path).then(|| old_path.clone())
+                })
+                .collect::<Vec<_>>();
+            obsolete_paths.sort();
+            obsolete_paths.dedup();
+            // Remove old keys together: a new key can belong to another worktree's file
+            // with the same relative path until that file has also been reordered.
+            multibuffer.remove_excerpts_for_paths(obsolete_paths, cx);
+            for (path, buffer, ranges) in &locations {
+                multibuffer.set_excerpts_for_path(
+                    path.clone(),
+                    buffer.clone(),
+                    ranges.clone(),
+                    multibuffer_context_lines(cx),
+                    cx,
+                );
+            }
+            // Reused editors need anchors from their own excerpts, after all paths have moved.
+            let snapshot = multibuffer.snapshot(cx);
+            let mut ranges = locations
+                .iter()
+                .flat_map(|(_, buffer, ranges)| {
+                    let buffer_snapshot = buffer.read(cx).snapshot();
+                    ranges
+                        .iter()
+                        .map(move |range| buffer_snapshot.anchor_range_inside(range.clone()))
+                })
+                .filter_map(|range| {
+                    Some(
+                        snapshot.anchor_in_buffer(range.start)?
+                            ..snapshot.anchor_in_buffer(range.end)?,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ranges.sort_by(|left, right| left.start.cmp(&right.start, &snapshot));
+            ranges
+        });
         let editor = existing.unwrap_or_else(|| {
             cx.new(|cx| {
                 let mut editor = Editor::for_multibuffer(

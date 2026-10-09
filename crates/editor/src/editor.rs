@@ -9255,6 +9255,7 @@ impl Editor {
                 Self::open_locations_in_multibuffer(
                     workspace,
                     locations,
+                    None,
                     format!("Selections for '{title}'"),
                     false,
                     false,
