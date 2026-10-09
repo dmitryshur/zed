@@ -7114,6 +7114,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "notifications",
+ "parking_lot",
  "picker",
  "pretty_assertions",
  "project",

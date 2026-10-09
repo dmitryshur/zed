@@ -39,7 +39,6 @@ use crate::{
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
@@ -2658,12 +2657,7 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         cx: &App,
     ) -> Option<(DisplayRow, Option<u32>)> {
-        if !cx.has_flag::<DiffReviewFeatureFlag>() {
-            return None;
-        }
-
-        let show_diff_review_button = self.editor.read(cx).show_diff_review_button();
-        if !show_diff_review_button {
+        if !self.editor.read(cx).diff_review_enabled(cx) {
             return None;
         }
 
@@ -2687,6 +2681,11 @@ impl EditorElement {
 
         let editor = self.editor.read(cx);
         if editor.is_buffer_folded(buffer_id, cx) {
+            return None;
+        }
+        if let (Some(provider), Some(row_info)) = (editor.diff_review_provider(), row_info)
+            && !provider.can_review_row(row_info, cx)
+        {
             return None;
         }
 

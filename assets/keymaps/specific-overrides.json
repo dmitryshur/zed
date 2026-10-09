@@ -53,4 +53,11 @@
       "tab": "picker::MultiSelectNext",
     },
   },
+  {
+    "context": "PullRequestPicker || (PullRequestPicker > Picker > Editor) || (PullRequestPicker > Picker > menu)",
+    "bindings": {
+      "ctrl-h": "pull_request_picker::PreviousFilter",
+      "ctrl-l": "pull_request_picker::NextFilter",
+    },
+  },
 ]

@@ -137,6 +137,7 @@ mod tests {
                 repo_path: RepoPath::new(path).unwrap(),
                 status: FileStatus::Untracked,
                 old_side: OldSide::Absent,
+                old_path: None,
             })
             .collect()
     }

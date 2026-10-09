@@ -6,6 +6,7 @@ use ::git::{
     status::FileStatus,
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
+use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use project::git_store::Repository;
 
 #[derive(Clone)]
@@ -38,6 +39,21 @@ pub trait DiffHunkRenderer {
     fn render_hunk_as_staged(&self, status: &DiffHunkStatus, _cx: &App) -> bool {
         !status.has_secondary_hunk()
     }
+}
+
+/// Takes over the gutter's "add review" button, so lines can be reviewed somewhere other than
+/// the editor's built-in, locally stored review comments.
+pub trait DiffReviewProvider {
+    fn can_review_row(&self, row_info: &RowInfo, cx: &App) -> bool;
+
+    /// Called with the lines picked by clicking or dragging the gutter button.
+    fn review_rows(
+        &self,
+        editor: WeakEntity<Editor>,
+        range: Range<Anchor>,
+        window: &mut Window,
+        cx: &mut App,
+    );
 }
 
 pub struct DefaultDiffHunkRenderer;
@@ -1018,6 +1034,7 @@ impl Editor {
         self.toggle_diff_hunks_in_ranges(ranges, cx);
     }
 
+    #[cfg(test)]
     pub(super) fn show_diff_review_button(&self) -> bool {
         self.show_diff_review_button
     }
@@ -1097,9 +1114,66 @@ impl Editor {
         if let Some(drag_state) = self.diff_review_drag_state.take() {
             let snapshot = self.snapshot(window, cx);
             let range = drag_state.row_range(&snapshot.display_snapshot);
-            self.show_diff_review_overlay(*range.start()..*range.end(), window, cx);
+            match self.diff_review_provider.clone() {
+                Some(provider) => {
+                    let anchor_range =
+                        self.diff_review_anchor_range(*range.start()..*range.end(), window, cx);
+                    let editor = cx.entity().downgrade();
+                    // The provider usually updates this editor, which is mid-update here.
+                    window.defer(cx, move |window, cx| {
+                        provider.review_rows(editor, anchor_range, window, cx);
+                    });
+                }
+                None => self.show_diff_review_overlay(*range.start()..*range.end(), window, cx),
+            }
         }
         cx.notify();
+    }
+
+    pub fn set_diff_review_provider(
+        &mut self,
+        provider: Option<Arc<dyn DiffReviewProvider>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff_review_provider = provider;
+        cx.notify();
+    }
+
+    pub fn diff_review_provider(&self) -> Option<&Arc<dyn DiffReviewProvider>> {
+        self.diff_review_provider.as_ref()
+    }
+
+    pub(super) fn diff_review_enabled(&self, cx: &App) -> bool {
+        self.diff_review_provider.is_some()
+            || (self.show_diff_review_button
+                && cx.has_flag::<DiffReviewFeatureFlag>()
+                && !DisableAiSettings::is_ai_disabled_for_buffer(
+                    self.buffer.read(cx).as_singleton().as_ref(),
+                    cx,
+                ))
+    }
+
+    /// From the start of the first row to the end of the last one.
+    fn diff_review_anchor_range(
+        &mut self,
+        display_range: Range<DisplayRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Range<Anchor> {
+        let Range { start, end } = display_range.sorted();
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let editor_snapshot = self.snapshot(window, cx);
+        let start_point = editor_snapshot
+            .display_snapshot
+            .display_point_to_point(start.as_display_point(), Bias::Left);
+        let end_point = editor_snapshot
+            .display_snapshot
+            .display_point_to_point(end.as_display_point(), Bias::Left);
+        let line_end = Point::new(
+            end_point.row,
+            buffer_snapshot.line_len(MultiBufferRow(end_point.row)),
+        );
+        buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end)
     }
 
     pub(super) fn cancel_diff_review_drag(&mut self, cx: &mut Context<Self>) {

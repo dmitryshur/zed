@@ -1126,6 +1126,14 @@
     },
   },
   {
+    "context": "PullRequestComposer > Editor && mode == auto_height",
+    "bindings": {
+      "enter": "editor::Newline",
+      "escape": "pull_request_review::CancelComment",
+      "ctrl-enter": "pull_request_review::SubmitComment",
+    },
+  },
+  {
     "context": "GitPanel",
     "bindings": {
       "ctrl-g ctrl-g": "git::Fetch",

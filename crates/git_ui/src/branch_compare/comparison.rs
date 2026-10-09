@@ -24,7 +24,10 @@ use project::{
 };
 use util::{ResultExt as _, paths::PathStyle};
 
-use crate::commit_view::{GitBlob, build_buffer, build_buffer_diff, worktree_id_for_repo_path};
+use crate::{
+    commit_view::{GitBlob, build_buffer, build_buffer_diff, worktree_id_for_repo_path},
+    pull_request::{PullRequestReview, PullRequestReviewEvent, ReviewFileContext, ReviewRange},
+};
 
 pub(crate) const REMOTE_NOT_SUPPORTED: &str =
     "Comparing branches is not supported for remote projects";
@@ -84,6 +87,21 @@ impl LocalGitObjects {
         commits
             .try_into()
             .map_err(|_| anyhow!("unexpected number of resolved commits"))
+    }
+
+    /// The text of a file at a commit, or `None` when it doesn't exist there or is binary.
+    pub(crate) async fn load_text(&self, commit: Oid, path: &RepoPath) -> Result<Option<String>> {
+        let contents = self
+            .backend
+            .load_revisions(vec![format!("{commit}:{}", path.as_unix_str())])
+            .await?
+            .into_iter()
+            .next()
+            .flatten();
+        Ok(match contents.map(decode_file_text).transpose()? {
+            Some(FileText::Text(text)) => Some(text),
+            Some(FileText::Binary) | None => None,
+        })
     }
 
     async fn diff_tree(&self, request: DiffTreeType) -> Result<TreeDiff> {
@@ -146,6 +164,8 @@ pub(crate) struct ComparisonEntry {
     pub(crate) repo_path: RepoPath,
     pub(crate) status: FileStatus,
     pub(crate) old_side: OldSide,
+    /// The path the old side had, for renamed files.
+    pub(crate) old_path: Option<RepoPath>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +191,75 @@ enum ComparisonSource {
         title: SharedString,
         files: HashMap<RepoPath, Arc<CommitFile>>,
     },
+    PullRequest {
+        review: Entity<PullRequestReview>,
+        range: ReviewRange,
+        /// The base and head the pull request had at the last refresh.
+        heads: (Oid, Oid),
+        title: SharedString,
+    },
+}
+
+/// What a pull request comparison diffs: `base` and `compared` identify the loaded state.
+struct PullRequestDiffPlan {
+    mode: ComparisonMode,
+    base: Oid,
+    compared: Oid,
+    request: DiffTreeType,
+}
+
+fn pull_request_diff_plan(
+    range: ReviewRange,
+    base_ref: Oid,
+    remote_head: Oid,
+    local_head: Option<Oid>,
+    on_branch: bool,
+) -> PullRequestDiffPlan {
+    let working_tree = |base: Oid, local_head: Oid| PullRequestDiffPlan {
+        mode: ComparisonMode::WorkingTree,
+        base,
+        compared: local_head,
+        request: DiffTreeType::MergeBaseWithWorktree {
+            base: base.to_string().into(),
+        },
+    };
+    let local_head = local_head.filter(|_| on_branch);
+    match (range, local_head) {
+        (ReviewRange::All, Some(local_head)) => working_tree(base_ref, local_head),
+        (ReviewRange::All, None) => PullRequestDiffPlan {
+            mode: ComparisonMode::Committed,
+            base: base_ref,
+            compared: remote_head,
+            request: DiffTreeType::MergeBase {
+                base: base_ref.to_string().into(),
+                head: remote_head.to_string().into(),
+            },
+        },
+        (ReviewRange::SinceLastReview(reviewed), Some(local_head)) => {
+            working_tree(reviewed, local_head)
+        }
+        (ReviewRange::SinceLastReview(reviewed), None) => PullRequestDiffPlan {
+            mode: ComparisonMode::Committed,
+            base: reviewed,
+            compared: remote_head,
+            request: DiffTreeType::Since {
+                base: reviewed.to_string().into(),
+                head: remote_head.to_string().into(),
+            },
+        },
+        (ReviewRange::Commit { sha, parent }, Some(local_head)) if local_head == sha => {
+            working_tree(parent, local_head)
+        }
+        (ReviewRange::Commit { sha, parent }, _) => PullRequestDiffPlan {
+            mode: ComparisonMode::Committed,
+            base: parent,
+            compared: sha,
+            request: DiffTreeType::Since {
+                base: parent.to_string().into(),
+                head: sha.to_string().into(),
+            },
+        },
+    }
 }
 
 pub(crate) enum ComparisonEvent {
@@ -196,7 +285,7 @@ pub(crate) struct BranchComparison {
     /// The mode and commits the loaded entries were computed for.
     loaded_for: Option<(ComparisonMode, [Oid; 2])>,
     refresh_task: Task<()>,
-    _repository_subscription: Option<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<ComparisonEvent> for BranchComparison {}
@@ -233,7 +322,7 @@ impl BranchComparison {
             state: ComparisonState::Loading,
             loaded_for: None,
             refresh_task: Task::ready(()),
-            _repository_subscription: Some(repository_subscription),
+            _subscriptions: vec![repository_subscription],
         };
         this.schedule_refresh(Duration::ZERO, cx);
         this
@@ -273,6 +362,7 @@ impl BranchComparison {
                     } else {
                         OldSide::Absent
                     },
+                    old_path: None,
                 });
                 (file.path.clone(), Arc::new(file))
             })
@@ -287,8 +377,107 @@ impl BranchComparison {
             state: ComparisonState::Loaded(entries.into()),
             loaded_for: None,
             refresh_task: Task::ready(()),
-            _repository_subscription: None,
+            _subscriptions: Vec::new(),
         }
+    }
+
+    pub(crate) fn for_pull_request(
+        project: Entity<Project>,
+        repository: Entity<Repository>,
+        review: Entity<PullRequestReview>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let repository_subscription = cx.subscribe(
+            &repository,
+            |this, _, event: &RepositoryEvent, cx| match event {
+                RepositoryEvent::StatusesChanged => {
+                    if this.mode == ComparisonMode::WorkingTree {
+                        this.schedule_refresh(REFRESH_DEBOUNCE, cx);
+                    }
+                }
+                RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
+                    this.schedule_refresh(REFRESH_DEBOUNCE, cx);
+                }
+                _ => {}
+            },
+        );
+        let review_subscription =
+            cx.subscribe(&review, |this, review, _: &PullRequestReviewEvent, cx| {
+                let details = review.read(cx).details();
+                let new_heads = (details.base_ref_oid, details.head_ref_oid);
+                let new_title = pull_request_title(details.number, &details.title);
+                if let ComparisonSource::PullRequest { heads, title, .. } = &mut this.source {
+                    *title = new_title;
+                    if *heads != new_heads {
+                        *heads = new_heads;
+                        this.schedule_refresh(Duration::ZERO, cx);
+                    }
+                }
+            });
+        let details = review.read(cx).details();
+        let heads = (details.base_ref_oid, details.head_ref_oid);
+        let title = pull_request_title(details.number, &details.title);
+        let mut this = Self {
+            project,
+            repository,
+            source: ComparisonSource::PullRequest {
+                review,
+                range: ReviewRange::All,
+                heads,
+                title,
+            },
+            git_objects: None,
+            mode: ComparisonMode::Committed,
+            state: ComparisonState::Loading,
+            loaded_for: None,
+            refresh_task: Task::ready(()),
+            _subscriptions: vec![repository_subscription, review_subscription],
+        };
+        this.schedule_refresh(Duration::ZERO, cx);
+        this
+    }
+
+    pub(crate) fn pull_request_review(&self) -> Option<&Entity<PullRequestReview>> {
+        match &self.source {
+            ComparisonSource::PullRequest { review, .. } => Some(review),
+            ComparisonSource::Branches { .. } | ComparisonSource::Commit { .. } => None,
+        }
+    }
+
+    pub(crate) fn review_range(&self) -> Option<ReviewRange> {
+        match &self.source {
+            ComparisonSource::PullRequest { range, .. } => Some(*range),
+            ComparisonSource::Branches { .. } | ComparisonSource::Commit { .. } => None,
+        }
+    }
+
+    pub(crate) fn set_review_range(&mut self, new_range: ReviewRange, cx: &mut Context<Self>) {
+        if let ComparisonSource::PullRequest { range, .. } = &mut self.source
+            && *range != new_range
+        {
+            *range = new_range;
+            self.state = ComparisonState::Loading;
+            self.loaded_for = None;
+            cx.emit(ComparisonEvent::EntriesChanged);
+            self.schedule_refresh(Duration::ZERO, cx);
+            cx.notify();
+        }
+    }
+
+    /// What the review comments of a file shown from this comparison attach to.
+    pub(crate) fn review_file_context(&self, repo_path: &RepoPath) -> Option<ReviewFileContext> {
+        let ComparisonSource::PullRequest { review, range, .. } = &self.source else {
+            return None;
+        };
+        Some(ReviewFileContext {
+            review: review.clone(),
+            repo_path: repo_path.clone(),
+            range: *range,
+            view_commit: match self.mode {
+                ComparisonMode::WorkingTree => None,
+                ComparisonMode::Committed => self.compared_commit(),
+            },
+        })
     }
 
     pub(crate) fn title(&self) -> SharedString {
@@ -297,6 +486,7 @@ impl BranchComparison {
                 format!("{} since {}", compared.name(), base.name()).into()
             }
             ComparisonSource::Commit { title, .. } => title.clone(),
+            ComparisonSource::PullRequest { title, .. } => title.clone(),
         }
     }
 
@@ -310,7 +500,7 @@ impl BranchComparison {
 
     pub(crate) fn compared_commit(&self) -> Option<Oid> {
         match &self.source {
-            ComparisonSource::Branches { .. } => self
+            ComparisonSource::Branches { .. } | ComparisonSource::PullRequest { .. } => self
                 .loaded_for
                 .map(|(_, [_, compared_commit])| compared_commit),
             ComparisonSource::Commit { sha, .. } => Some(*sha),
@@ -341,7 +531,9 @@ impl BranchComparison {
                         ComparisonSource::Branches { base, compared } => {
                             friendly_error(&error, base, compared)
                         }
-                        ComparisonSource::Commit { .. } => format!("{error:#}").into(),
+                        ComparisonSource::Commit { .. } | ComparisonSource::PullRequest { .. } => {
+                            format!("{error:#}").into()
+                        }
                     };
                     this.state = ComparisonState::Failed(message);
                     this.loaded_for = None;
@@ -354,13 +546,37 @@ impl BranchComparison {
     }
 
     async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
-        let Some((git_objects, base, compared)) =
-            this.update(cx, |this, _| match &this.source {
+        enum Target {
+            Branches(Branch, Branch),
+            PullRequest(PullRequestDiffPlan, HashMap<RepoPath, RepoPath>),
+        }
+        let Some((git_objects, target)) = this.update(cx, |this, cx| {
+            let target = match &this.source {
                 ComparisonSource::Branches { base, compared } => {
-                    Some((this.git_objects.clone(), base.clone(), compared.clone()))
+                    Target::Branches(base.clone(), compared.clone())
                 }
-                ComparisonSource::Commit { .. } => None,
-            })?
+                ComparisonSource::PullRequest { review, range, .. } => {
+                    let review = review.read(cx);
+                    let details = review.details();
+                    let plan = pull_request_diff_plan(
+                        *range,
+                        details.base_ref_oid,
+                        details.head_ref_oid,
+                        review.local_head(cx),
+                        review.is_on_branch(cx),
+                    );
+                    let renames = match range {
+                        ReviewRange::All => review.renames(),
+                        ReviewRange::SinceLastReview(_) | ReviewRange::Commit { .. } => {
+                            HashMap::default()
+                        }
+                    };
+                    Target::PullRequest(plan, renames)
+                }
+                ComparisonSource::Commit { .. } => return None,
+            };
+            Some((this.git_objects.clone(), target))
+        })?
         else {
             return Ok(());
         };
@@ -376,10 +592,29 @@ impl BranchComparison {
             }
         };
 
-        let commits = git_objects.resolve_commits([&base, &compared]).await?;
-        let [base_commit, compared_commit] = commits;
+        let (mode, commits, request, renames) = match target {
+            Target::Branches(base, compared) => {
+                let commits = git_objects.resolve_commits([&base, &compared]).await?;
+                let [base_commit, compared_commit] = commits;
+                let mode = this.update(cx, |this, cx| {
+                    Self::mode_for(&this.repository, &compared, cx)
+                })?;
+                let request = match mode {
+                    ComparisonMode::Committed => DiffTreeType::MergeBase {
+                        base: base_commit.to_string().into(),
+                        head: compared_commit.to_string().into(),
+                    },
+                    ComparisonMode::WorkingTree => DiffTreeType::MergeBaseWithWorktree {
+                        base: base_commit.to_string().into(),
+                    },
+                };
+                (mode, commits, request, HashMap::default())
+            }
+            Target::PullRequest(plan, renames) => {
+                (plan.mode, [plan.base, plan.compared], plan.request, renames)
+            }
+        };
         let (mode, already_loaded) = this.update(cx, |this, cx| {
-            let mode = Self::mode_for(&this.repository, &compared, cx);
             if mode != this.mode {
                 this.mode = mode;
                 cx.emit(ComparisonEvent::ModeChanged);
@@ -393,15 +628,6 @@ impl BranchComparison {
             return Ok(());
         }
 
-        let request = match mode {
-            ComparisonMode::Committed => DiffTreeType::MergeBase {
-                base: base_commit.to_string().into(),
-                head: compared_commit.to_string().into(),
-            },
-            ComparisonMode::WorkingTree => DiffTreeType::MergeBaseWithWorktree {
-                base: base_commit.to_string().into(),
-            },
-        };
         let tree_diff = git_objects.diff_tree(request).await?;
 
         this.update(cx, |this, cx| {
@@ -414,7 +640,8 @@ impl BranchComparison {
                     .collect(),
                 ComparisonMode::Committed => Vec::new(),
             };
-            this.state = ComparisonState::Loaded(build_entries(tree_diff, statuses).into());
+            this.state =
+                ComparisonState::Loaded(build_entries(tree_diff, statuses, &renames).into());
             this.loaded_for = Some((mode, commits));
             cx.emit(ComparisonEvent::EntriesChanged);
             cx.notify();
@@ -518,7 +745,7 @@ impl BranchComparison {
                     new: text(&file.new_text),
                 }))
             }
-            ComparisonSource::Branches { .. } => {
+            ComparisonSource::Branches { .. } | ComparisonSource::PullRequest { .. } => {
                 let (Some(git_objects), Some(compared_commit)) =
                     (self.git_objects.clone(), self.compared_commit())
                 else {
@@ -597,6 +824,10 @@ impl BranchComparison {
     }
 }
 
+fn pull_request_title(number: u64, title: &str) -> SharedString {
+    format!("#{number} {title}").into()
+}
+
 fn tree_status_to_file_status(status: &TreeDiffStatus) -> FileStatus {
     let status_code = match status {
         TreeDiffStatus::Added => StatusCode::Added,
@@ -614,6 +845,7 @@ fn tree_status_to_file_status(status: &TreeDiffStatus) -> FileStatus {
 fn build_entries(
     tree_diff: TreeDiff,
     statuses: Vec<(RepoPath, FileStatus)>,
+    renames: &HashMap<RepoPath, RepoPath>,
 ) -> Vec<ComparisonEntry> {
     let mut entries = tree_diff
         .entries
@@ -629,10 +861,31 @@ fn build_entries(
                 repo_path: repo_path.clone(),
                 status: tree_status_to_file_status(&tree_status),
                 old_side,
+                old_path: None,
             };
             (repo_path, entry)
         })
         .collect::<HashMap<_, _>>();
+
+    // Git diffs without rename detection here; take GitHub's renames so the paths and old-side
+    // lines match the pull request's.
+    for (new_path, old_path) in renames {
+        let Some(OldSide::Blob(old_blob)) = entries
+            .get(old_path)
+            .filter(|entry| entry.status.is_deleted())
+            .map(|entry| entry.old_side)
+        else {
+            continue;
+        };
+        if let Some(entry) = entries.get_mut(new_path)
+            && entry.old_side == OldSide::Absent
+        {
+            entry.old_side = OldSide::Blob(old_blob);
+            entry.status = tree_status_to_file_status(&TreeDiffStatus::Modified { old: old_blob });
+            entry.old_path = Some(old_path.clone());
+            entries.remove(old_path);
+        }
+    }
 
     for (repo_path, status) in statuses {
         if status.is_conflicted() {
@@ -643,12 +896,14 @@ fn build_entries(
                     repo_path,
                     status,
                     old_side: OldSide::Unknown,
+                    old_path: None,
                 });
         } else if status.is_untracked() {
             entries.entry(repo_path.clone()).or_insert(ComparisonEntry {
                 repo_path,
                 status: tree_status_to_file_status(&TreeDiffStatus::Added),
                 old_side: OldSide::Absent,
+                old_path: None,
             });
         }
     }
@@ -760,6 +1015,7 @@ pub(crate) mod tests {
                 (repo_path("g/untracked.rs"), FileStatus::Untracked),
                 (repo_path("b/modified.rs"), status(StatusCode::Modified)),
             ],
+            &HashMap::default(),
         );
         assert_eq!(
             entries,
@@ -768,36 +1024,179 @@ pub(crate) mod tests {
                     repo_path: repo_path("a/added.rs"),
                     status: status(StatusCode::Added),
                     old_side: OldSide::Absent,
+                    old_path: None,
                 },
                 ComparisonEntry {
                     repo_path: repo_path("b/modified.rs"),
                     status: status(StatusCode::Modified),
                     old_side: OldSide::Blob(oid(1)),
+                    old_path: None,
                 },
                 ComparisonEntry {
                     repo_path: repo_path("c/deleted.rs"),
                     status: status(StatusCode::Deleted),
                     old_side: OldSide::Blob(oid(2)),
+                    old_path: None,
                 },
                 ComparisonEntry {
                     repo_path: repo_path("d/conflicted.rs"),
                     status: conflict,
                     old_side: OldSide::Blob(oid(3)),
+                    old_path: None,
                 },
                 ComparisonEntry {
                     repo_path: repo_path("e/deleted_but_untracked.rs"),
                     status: status(StatusCode::Deleted),
                     old_side: OldSide::Blob(oid(4)),
+                    old_path: None,
                 },
                 ComparisonEntry {
                     repo_path: repo_path("f/conflicted_only.rs"),
                     status: conflict,
                     old_side: OldSide::Unknown,
+                    old_path: None,
                 },
                 ComparisonEntry {
                     repo_path: repo_path("g/untracked.rs"),
                     status: status(StatusCode::Added),
                     old_side: OldSide::Absent,
+                    old_path: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pull_request_diff_plan() {
+        let base = oid(1);
+        let remote_head = oid(2);
+        let local_head = oid(3);
+        let reviewed = oid(4);
+        let describe = |plan: PullRequestDiffPlan| {
+            let request = match plan.request {
+                DiffTreeType::MergeBase { base, head } => format!("{base}...{head}"),
+                DiffTreeType::MergeBaseWithWorktree { base } => format!("{base}...worktree"),
+                DiffTreeType::Since { base, head } => format!("{base}..{head}"),
+            };
+            (plan.mode, plan.base, plan.compared, request)
+        };
+        let short = |oid: Oid| oid.to_string();
+        assert_eq!(
+            describe(pull_request_diff_plan(
+                ReviewRange::All,
+                base,
+                remote_head,
+                Some(local_head),
+                true
+            )),
+            (
+                ComparisonMode::WorkingTree,
+                base,
+                local_head,
+                format!("{}...worktree", short(base))
+            )
+        );
+        assert_eq!(
+            describe(pull_request_diff_plan(
+                ReviewRange::All,
+                base,
+                remote_head,
+                Some(local_head),
+                false
+            )),
+            (
+                ComparisonMode::Committed,
+                base,
+                remote_head,
+                format!("{}...{}", short(base), short(remote_head))
+            ),
+            "off the branch, the pull request's own head is shown"
+        );
+        assert_eq!(
+            describe(pull_request_diff_plan(
+                ReviewRange::SinceLastReview(reviewed),
+                base,
+                remote_head,
+                Some(local_head),
+                true
+            )),
+            (
+                ComparisonMode::WorkingTree,
+                reviewed,
+                local_head,
+                format!("{}...worktree", short(reviewed))
+            )
+        );
+        assert_eq!(
+            describe(pull_request_diff_plan(
+                ReviewRange::Commit {
+                    sha: local_head,
+                    parent: reviewed
+                },
+                base,
+                remote_head,
+                Some(local_head),
+                true
+            )),
+            (
+                ComparisonMode::WorkingTree,
+                reviewed,
+                local_head,
+                format!("{}...worktree", short(reviewed))
+            ),
+            "the checked-out commit stays editable"
+        );
+        assert_eq!(
+            describe(pull_request_diff_plan(
+                ReviewRange::Commit {
+                    sha: reviewed,
+                    parent: base
+                },
+                base,
+                remote_head,
+                Some(local_head),
+                true
+            )),
+            (
+                ComparisonMode::Committed,
+                base,
+                reviewed,
+                format!("{}..{}", short(base), short(reviewed))
+            )
+        );
+    }
+
+    #[test]
+    fn test_build_entries_with_renames() {
+        let tree_diff = TreeDiff {
+            entries: [
+                (repo_path("old.rs"), TreeDiffStatus::Deleted { old: oid(1) }),
+                (repo_path("new.rs"), TreeDiffStatus::Added),
+                (
+                    repo_path("gone.rs"),
+                    TreeDiffStatus::Deleted { old: oid(2) },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let renames = [(repo_path("new.rs"), repo_path("old.rs"))]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            build_entries(tree_diff, Vec::new(), &renames),
+            vec![
+                ComparisonEntry {
+                    repo_path: repo_path("gone.rs"),
+                    status: status(StatusCode::Deleted),
+                    old_side: OldSide::Blob(oid(2)),
+                    old_path: None,
+                },
+                ComparisonEntry {
+                    repo_path: repo_path("new.rs"),
+                    status: status(StatusCode::Modified),
+                    old_side: OldSide::Blob(oid(1)),
+                    old_path: Some(repo_path("old.rs")),
                 },
             ]
         );
@@ -821,7 +1220,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn init_test(cx: &mut TestAppContext) {
+    pub(crate) fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);

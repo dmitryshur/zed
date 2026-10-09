@@ -13,7 +13,7 @@ use editor::{
 use git::repository::RepoPath;
 use gpui::{
     AnyEntity, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    SharedString, Subscription, Task, Window,
+    SharedString, Subscription, Task, WeakEntity, Window,
 };
 use language::{Buffer, Capability, HighlightedText, Point};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -28,6 +28,7 @@ use workspace::{
 };
 
 use super::comparison::LoadedCompareFile;
+use crate::pull_request::{ReviewEditorBinding, ReviewFileContext};
 
 struct ShownFile {
     repo_path: RepoPath,
@@ -39,7 +40,10 @@ struct ShownFile {
 /// this view's contents instead of opening a new tab.
 pub(crate) struct CompareDiffView {
     editor: Entity<SplittableEditor>,
+    project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
     shown_file: Option<ShownFile>,
+    review_binding: Option<Entity<ReviewEditorBinding>>,
     error: Option<SharedString>,
     comparison_title: SharedString,
     /// Working-tree buffers that had unsaved edits when another file was shown. They're kept
@@ -56,11 +60,12 @@ impl CompareDiffView {
         cx: &mut Context<Self>,
     ) -> Self {
         let multibuffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
+        let workspace_handle = workspace.downgrade();
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer,
-                project,
+                project.clone(),
                 workspace,
                 window,
                 cx,
@@ -77,7 +82,10 @@ impl CompareDiffView {
         });
         Self {
             editor,
+            project,
+            workspace: workspace_handle,
             shown_file: None,
+            review_binding: None,
             error: None,
             comparison_title: SharedString::default(),
             edited_buffers: Vec::new(),
@@ -90,8 +98,13 @@ impl CompareDiffView {
     }
 
     #[cfg(test)]
-    pub(super) fn editor(&self) -> &Entity<SplittableEditor> {
+    pub(crate) fn editor(&self) -> &Entity<SplittableEditor> {
         &self.editor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_binding(&self) -> Option<&Entity<ReviewEditorBinding>> {
+        self.review_binding.as_ref()
     }
 
     pub(crate) fn scroll(
@@ -111,12 +124,14 @@ impl CompareDiffView {
         &mut self,
         file: LoadedCompareFile,
         comparison_title: SharedString,
+        review: Option<ReviewFileContext>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.clear_shown_file(cx);
         let path_key = PathKey::for_buffer(&file.buffer, cx);
         let max_point = file.buffer.read(cx).max_point();
+        let diff = file.diff.clone();
         self.editor.update(cx, |editor, cx| {
             editor.update_excerpts_for_path(
                 path_key.clone(),
@@ -138,6 +153,23 @@ impl CompareDiffView {
                     cx,
                 );
             });
+        });
+        self.review_binding = review.map(|context| {
+            let workspace = self.workspace.clone();
+            let language_registry = self.project.read(cx).languages().clone();
+            let editor = self.editor.clone();
+            let buffer = file.buffer.clone();
+            cx.new(|cx| {
+                ReviewEditorBinding::new(
+                    context,
+                    &editor,
+                    buffer,
+                    diff,
+                    workspace,
+                    language_registry,
+                    cx,
+                )
+            })
         });
         self.shown_file = Some(ShownFile {
             repo_path: file.repo_path,
@@ -187,8 +219,16 @@ impl CompareDiffView {
         });
     }
 
+    /// Removes the review threads when their pull request stops being reviewed.
+    pub(crate) fn clear_review(&mut self, cx: &mut Context<Self>) {
+        if let Some(binding) = self.review_binding.take() {
+            binding.update(cx, |binding, cx| binding.detach(cx));
+        }
+    }
+
     fn clear_shown_file(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.clear_review(cx);
         if let Some(shown_file) = self.shown_file.take() {
             if shown_file.buffer.read(cx).is_dirty()
                 && !self.edited_buffers.contains(&shown_file.buffer)

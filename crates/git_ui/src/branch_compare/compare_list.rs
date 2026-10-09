@@ -7,12 +7,15 @@ use file_icons::FileIcons;
 use fuzzy_nucleo::{Case, LengthPenalty, StringMatchCandidate};
 use git::{Oid, repository::RepoPath};
 use gpui::{
-    Action as _, AppContext as _, Context, Entity, FocusHandle, Focusable as _, ScrollStrategy,
-    SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window,
-    point, uniform_list,
+    Action as _, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _,
+    ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    WeakFocusHandle, Window, point, uniform_list,
 };
 use settings::Settings as _;
-use ui::{IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    Banner, ContextMenu, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu, Severity,
+    Tooltip, prelude::*,
+};
 use util::paths::PathStyle;
 use workspace::Workspace;
 
@@ -25,7 +28,11 @@ use super::{
     },
     file_tree::{CompareRow, build_rows},
 };
-use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
+use crate::{
+    git_panel_settings::GitPanelSettings,
+    git_status_icon,
+    pull_request::{PullRequestReview, ReviewRange},
+};
 
 const TREE_INDENT: f32 = 16.0;
 
@@ -67,6 +74,7 @@ struct ComparedFile {
     entry: ComparisonEntry,
     compared_commit: Option<Oid>,
     mode: ComparisonMode,
+    review_range: Option<ReviewRange>,
 }
 
 struct LoadingFile {
@@ -112,6 +120,8 @@ pub(crate) struct CompareList {
     blame_commit_task: Task<()>,
     _blame_lookup_subscription: Option<Subscription>,
     _comparison_subscription: Option<Subscription>,
+    _review_subscriptions: Vec<Subscription>,
+    review_task: Task<()>,
     _filter_subscriptions: Vec<Subscription>,
 }
 
@@ -140,8 +150,34 @@ impl CompareList {
             blame_commit_task: Task::ready(()),
             _blame_lookup_subscription: None,
             _comparison_subscription: None,
+            _review_subscriptions: Vec::new(),
+            review_task: Task::ready(()),
             _filter_subscriptions: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_paths(&self) -> Vec<(String, Option<String>)> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.repo_path.as_unix_str().to_string(),
+                    entry
+                        .old_path
+                        .as_ref()
+                        .map(|path| path.as_unix_str().to_string()),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn pull_request_review(&self, cx: &App) -> Option<Entity<PullRequestReview>> {
+        self.comparison
+            .as_ref()?
+            .read(cx)
+            .pull_request_review()
+            .cloned()
     }
 
     pub(crate) fn set_comparison(
@@ -157,6 +193,26 @@ impl CompareList {
                 this.handle_comparison_event(event, window, cx);
             })
         });
+        self.review_task = Task::ready(());
+        self._review_subscriptions = comparison
+            .as_ref()
+            .and_then(|comparison| comparison.read(cx).pull_request_review().cloned())
+            .map(|review| {
+                vec![
+                    cx.observe(&review, |_, _, cx| cx.notify()),
+                    cx.observe_window_activation(window, move |_, window, cx| {
+                        if window.is_window_active() {
+                            review.update(cx, |review, cx| review.refresh_if_stale(cx));
+                        }
+                    }),
+                ]
+            })
+            .unwrap_or_default();
+        if comparison.is_none()
+            && let Some(view) = self.diff_view.upgrade()
+        {
+            view.update(cx, |view, cx| view.clear_review(cx));
+        }
         self.initial_file_pending = comparison.is_some();
         self.comparison = comparison;
         self.entries = Arc::from([]);
@@ -441,6 +497,7 @@ impl CompareList {
             entry: entry.clone(),
             compared_commit: comparison.compared_commit(),
             mode: comparison.mode(),
+            review_range: comparison.review_range(),
         };
         if file != &updated_file {
             let focus = self
@@ -806,6 +863,7 @@ impl CompareList {
                 entry: entry.clone(),
                 compared_commit: comparison.read(cx).compared_commit(),
                 mode: comparison.read(cx).mode(),
+                review_range: comparison.read(cx).review_range(),
             },
             activation,
             focus_when_loaded: focus,
@@ -867,6 +925,10 @@ impl CompareList {
         };
         let comparison = comparison.read(cx);
         let title = comparison.title();
+        let review = result
+            .as_ref()
+            .ok()
+            .and_then(|file| comparison.review_file_context(&file.repo_path));
         let focus_editor = result.is_ok()
             && loading
                 .focus_when_loaded
@@ -876,7 +938,7 @@ impl CompareList {
         self.shown = Some(loading.file);
         view.update(cx, |view, cx| match result {
             Ok(file) => {
-                view.show_file(file, title, window, cx);
+                view.show_file(file, title, review, window, cx);
                 if let Some(row) = loading.initial_row {
                     view.reveal_row(row, window, cx);
                 }
@@ -916,7 +978,256 @@ impl CompareList {
         view
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pull_request_header(
+        &self,
+        comparison: &Entity<BranchComparison>,
+        review: &Entity<PullRequestReview>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border_color = cx.theme().colors().border_variant;
+        let range = comparison.read(cx).review_range();
+        let review_entity = review.clone();
+        let review = review.read(cx);
+        let details = review.details();
+        let url = details.url.clone();
+        let pending_count = review.pending_comment_count();
+        let byline = format!(
+            "@{} · {} ← {}",
+            details.author.as_deref().unwrap_or("ghost"),
+            details.base_ref_name,
+            details.head_ref_name
+        );
+        let range_label: SharedString = match range {
+            Some(ReviewRange::SinceLastReview(_)) => "Since your last review".into(),
+            Some(ReviewRange::Commit { sha, .. }) => details
+                .commits
+                .iter()
+                .find(|commit| commit.oid == sha)
+                .map(|commit| SharedString::from(commit.short_oid.clone()))
+                .unwrap_or_else(|| "One commit".into()),
+            Some(ReviewRange::All) | None => "All changes".into(),
+        };
+        let new_commits = review.new_commit_count(cx);
+        let on_branch = review.is_on_branch(cx);
+        let refresh_error = review.refresh_error().cloned();
+        let title = comparison.read(cx).title();
+        let range_menu = {
+            let comparison = comparison.downgrade();
+            let last_review_commit = details.last_review_commit.filter(|commit| {
+                details
+                    .commits
+                    .iter()
+                    .any(|pull_request_commit| pull_request_commit.oid == *commit)
+            });
+            let commits = details
+                .commits
+                .iter()
+                .filter_map(|commit| {
+                    Some((
+                        commit.oid,
+                        commit.parent?,
+                        format!("{} {}", commit.short_oid, commit.headline),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            PopoverMenu::new("pull-request-range")
+                .trigger_with_tooltip(
+                    Button::new("pull-request-range-trigger", range_label)
+                        .label_size(LabelSize::Small)
+                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                    Tooltip::text("Choose Which Changes to Show"),
+                )
+                .menu(move |window, cx| {
+                    let comparison = comparison.clone();
+                    let commits = commits.clone();
+                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                        let set_range = {
+                            let comparison = comparison.clone();
+                            move |range: ReviewRange| {
+                                let comparison = comparison.clone();
+                                move |_: &mut Window, cx: &mut App| {
+                                    comparison
+                                        .update(cx, |comparison, cx| {
+                                            comparison.set_review_range(range, cx)
+                                        })
+                                        .ok();
+                                }
+                            }
+                        };
+                        let mut menu = menu.toggleable_entry(
+                            "All changes",
+                            range == Some(ReviewRange::All),
+                            IconPosition::Start,
+                            None,
+                            set_range(ReviewRange::All),
+                        );
+                        if let Some(commit) = last_review_commit {
+                            let since = ReviewRange::SinceLastReview(commit);
+                            menu = menu.toggleable_entry(
+                                "Since your last review",
+                                range == Some(since),
+                                IconPosition::Start,
+                                None,
+                                set_range(since),
+                            );
+                        }
+                        menu = menu.separator().header("Commits");
+                        for (sha, parent, label) in commits.iter().rev() {
+                            let commit_range = ReviewRange::Commit {
+                                sha: *sha,
+                                parent: *parent,
+                            };
+                            menu = menu.toggleable_entry(
+                                label.clone(),
+                                range == Some(commit_range),
+                                IconPosition::Start,
+                                None,
+                                set_range(commit_range),
+                            );
+                        }
+                        menu
+                    }))
+                })
+        };
+        v_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(border_color)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::PullRequest)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(title).size(LabelSize::Small).truncate()),
+                    )
+                    .child(
+                        IconButton::new("open-pull-request", IconName::ArrowUpRight)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open on GitHub"))
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+                    .child(
+                        IconButton::new("refresh-pull-request", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Refresh"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(review) = this.pull_request_review(cx) {
+                                    review.update(cx, |review, cx| review.refresh(cx));
+                                }
+                            })),
+                    )
+                    .child(
+                        IconButton::new("clear-branch-comparison", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close Review"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_comparison(None, window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(byline)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .child(range_menu)
+                    .child(
+                        Button::new(
+                            "submit-pull-request-review",
+                            if pending_count == 0 {
+                                "Submit".to_string()
+                            } else {
+                                format!("Submit ({pending_count})")
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Filled)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(
+                                crate::pull_request::SubmitPullRequestReview.boxed_clone(),
+                                cx,
+                            )
+                        }),
+                    ),
+            )
+            .when_some(new_commits.filter(|count| *count > 0), |this, count| {
+                this.child(
+                    Banner::new()
+                        .severity(Severity::Info)
+                        .child(
+                            Label::new(if count == 1 {
+                                "1 new commit".to_string()
+                            } else {
+                                format!("{count} new commits")
+                            })
+                            .size(LabelSize::Small),
+                        )
+                        .action_slot(
+                            Button::new("update-pull-request", "Update")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_pull_request_checkout(&review_entity, cx);
+                                })),
+                        ),
+                )
+            })
+            .when(!on_branch, |this| {
+                this.child(
+                    Banner::new().severity(Severity::Warning).child(
+                        Label::new(
+                            "Showing the pull request's commits: its branch isn't checked out",
+                        )
+                        .size(LabelSize::Small),
+                    ),
+                )
+            })
+            .when_some(refresh_error, |this, error| {
+                this.child(
+                    Banner::new()
+                        .severity(Severity::Error)
+                        .child(Label::new(error).size(LabelSize::Small)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn update_pull_request_checkout(
+        &mut self,
+        review: &Entity<PullRequestReview>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = review.update(cx, |review, cx| review.update_checkout(cx));
+        let workspace = self.workspace.clone();
+        self.review_task = cx.spawn(async move |_, cx| {
+            if let Err(error) = task.await {
+                workspace
+                    .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                    .ok();
+            }
+        });
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(comparison) = self.comparison.clone()
+            && let Some(review) = comparison.read(cx).pull_request_review().cloned()
+        {
+            return self.render_pull_request_header(&comparison, &review, cx);
+        }
         let title = self
             .comparison
             .as_ref()
@@ -952,6 +1263,7 @@ impl CompareList {
                         })),
                 )
             })
+            .into_any_element()
     }
 
     fn render_message(message: SharedString) -> AnyElement {
@@ -1084,6 +1396,21 @@ impl CompareList {
                     .file_name()
                     .map(ToString::to_string)
                     .unwrap_or_default();
+                let thread_counts = self.pull_request_review(cx).and_then(|review| {
+                    review
+                        .read(cx)
+                        .thread_counts()
+                        .get(entry.repo_path.as_unix_str())
+                        .copied()
+                });
+                let tooltip = match &entry.old_path {
+                    Some(old_path) => format!(
+                        "{} → {}",
+                        old_path.display(PathStyle::local()),
+                        entry.repo_path.display(PathStyle::local())
+                    ),
+                    None => entry.repo_path.display(PathStyle::local()).to_string(),
+                };
                 ListItem::new(("branch-comparison-file", row_index))
                     .indent_level(*depth)
                     .indent_step_size(px(TREE_INDENT))
@@ -1098,9 +1425,26 @@ impl CompareList {
                             })
                             .truncate(),
                     )
-                    .tooltip(Tooltip::text(
-                        entry.repo_path.display(PathStyle::local()).to_string(),
-                    ))
+                    .end_slot::<AnyElement>(thread_counts.map(|(total, unresolved)| {
+                        h_flex()
+                            .gap_0p5()
+                            .child(Icon::new(IconName::Chat).size(IconSize::XSmall).color(
+                                if unresolved > 0 {
+                                    Color::Accent
+                                } else {
+                                    Color::Muted
+                                },
+                            ))
+                            .child(Label::new(total.to_string()).size(LabelSize::XSmall).color(
+                                if unresolved > 0 {
+                                    Color::Accent
+                                } else {
+                                    Color::Muted
+                                },
+                            ))
+                            .into_any_element()
+                    }))
+                    .tooltip(Tooltip::text(tooltip))
             }
         };
         Some(
@@ -1940,6 +2284,7 @@ mod tests {
             repo_path: RepoPath::new(path).expect("path should be valid"),
             status: git::status::FileStatus::Untracked,
             old_side: super::super::comparison::OldSide::Absent,
+            old_path: None,
         });
         for (query, expected) in [
             ("cmp", vec![1, 2]),

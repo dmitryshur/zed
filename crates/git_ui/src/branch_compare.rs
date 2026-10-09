@@ -18,9 +18,11 @@ use workspace::Workspace;
 
 use crate::git_panel::GitPanel;
 use branch_pair_picker::BranchPairPicker;
+#[cfg(test)]
+pub(crate) use compare_diff_view::CompareDiffView;
 pub(crate) use compare_list::CompareList;
 use compare_list::VerticalDirection;
-pub(crate) use comparison::BranchComparison;
+pub(crate) use comparison::{BranchComparison, LocalGitObjects};
 use comparison::{CompareLocation, REMOTE_NOT_SUPPORTED};
 
 actions!(

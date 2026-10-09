@@ -1195,6 +1195,13 @@
     },
   },
   {
+    "context": "PullRequestComposer > Editor && VimControl && vim_mode == normal",
+    "bindings": {
+      "ctrl-c": "pull_request_review::CancelComment",
+      "escape": "pull_request_review::CancelComment",
+    },
+  },
+  {
     "context": "CommitEditor > Editor && VimControl && !menu",
     "bindings": {
       "tab": "git_panel::FocusChanges",
