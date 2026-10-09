@@ -7,7 +7,7 @@ use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::{Settings, SettingsStore};
 use theme::ClientDecorationsExt;
 use theme_settings::ThemeSettings;
-use ui::{FluentBuilder, TintColor, prelude::*};
+use ui::{FluentBuilder, prelude::*};
 use workspace::WorkspaceSettings;
 
 pub fn init(cx: &mut App) {
@@ -79,17 +79,20 @@ impl ZedPromptRenderer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_action_id = self.actions.len().saturating_sub(1);
-        cx.notify();
-    }
-
-    fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
         self.active_action_id = 0;
         cx.notify();
     }
 
+    fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+        self.active_action_id = self.actions.len().saturating_sub(1);
+        cx.notify();
+    }
+
+    // Moving stops at the first and last buttons: wrapping from the default (often destructive)
+    // first button to the last one is easy to miss and confirms the wrong answer.
     fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
-        self.active_action_id = (self.active_action_id + 1) % self.actions.len();
+        self.active_action_id =
+            (self.active_action_id + 1).min(self.actions.len().saturating_sub(1));
         cx.notify();
     }
 
@@ -99,11 +102,7 @@ impl ZedPromptRenderer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_action_id > 0 {
-            self.active_action_id -= 1;
-        } else {
-            self.active_action_id = self.actions.len().saturating_sub(1);
-        }
+        self.active_action_id = self.active_action_id.saturating_sub(1);
         cx.notify();
     }
 }
@@ -142,16 +141,28 @@ impl Render for ZedPromptRenderer {
                 v_flex()
                     .gap_1()
                     .children(self.actions.iter().enumerate().map(|(ix, action)| {
-                        Button::new(ix, action.clone())
+                        let is_active = ix == self.active_action_id;
+                        let button = Button::new(ix, action.clone())
                             .full_width()
-                            .style(ButtonStyle::Outlined)
-                            .when(ix == self.active_action_id, |s| {
-                                s.style(ButtonStyle::Tinted(TintColor::Accent))
+                            .style(if is_active {
+                                // Transparent, so the hover background below shows through.
+                                ButtonStyle::OutlinedCustom(cx.theme().colors().border)
+                            } else {
+                                ButtonStyle::Outlined
                             })
                             .tab_index(ix as isize)
                             .on_click(cx.listener(move |_, _, _window, cx| {
                                 cx.emit(PromptResponse(ix));
-                            }))
+                            }));
+                        // The keyboard selection looks like a hovered button, so it's as easy
+                        // to see as the mouse's.
+                        div()
+                            .w_full()
+                            .rounded_sm()
+                            .when(is_active, |this| {
+                                this.bg(cx.theme().colors().ghost_element_hover)
+                            })
+                            .child(button)
                     })),
             );
 
@@ -210,5 +221,61 @@ impl EventEmitter<PromptResponse> for ZedPromptRenderer {}
 impl Focusable for ZedPromptRenderer {
     fn focus_handle(&self, _: &crate::App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt as _;
+    use gpui::{KeyBinding, TestAppContext, VisualTestContext};
+
+    struct EmptyView;
+
+    impl Render for EmptyView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn test_keyboard_selection_stops_at_the_ends(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            init(cx);
+            cx.bind_keys([
+                KeyBinding::new("enter", menu::Confirm, None),
+                KeyBinding::new("ctrl-j", menu::SelectNext, None),
+                KeyBinding::new("ctrl-k", menu::SelectPrevious, None),
+            ]);
+        });
+        let window = cx.add_window(|_, _| EmptyView);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        for (keys, expected_answer) in [
+            ("enter", 0),
+            ("ctrl-k enter", 0),
+            ("ctrl-j ctrl-j enter", 1),
+            ("ctrl-j ctrl-k ctrl-k enter", 0),
+        ] {
+            let answer = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    "Delete this comment?",
+                    None,
+                    &["Delete", "Cancel"],
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes(keys);
+            cx.run_until_parked();
+            assert_eq!(
+                answer.now_or_never(),
+                Some(Ok(expected_answer)),
+                "pressing {keys}"
+            );
+        }
     }
 }

@@ -10,7 +10,6 @@ workspace = true
 
 [lib]
 path = "src/ui_prompt.rs"
-test = false
 doctest = false
 
 [features]
@@ -25,3 +24,8 @@ theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
 workspace.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
