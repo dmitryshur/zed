@@ -19,7 +19,9 @@ pub mod searchable;
 pub mod security_modal;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
+mod floating_pane;
 pub mod focus_follows_mouse;
+pub use floating_pane::FloatingPaneLayer;
 mod status_bar;
 pub mod tasks;
 mod theme_preview;
@@ -1595,6 +1597,7 @@ pub struct Workspace {
     last_active_view_id: Option<proto::ViewId>,
     status_bar: Entity<StatusBar>,
     pub(crate) modal_layer: Entity<ModalLayer>,
+    floating_panes: Entity<FloatingPaneLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
     titlebar_focus_handle: FocusHandle,
@@ -1959,6 +1962,7 @@ impl Workspace {
 
         cx.emit(Event::WorkspaceCreated(weak_handle.clone()));
         let modal_layer = cx.new(|_| ModalLayer::new());
+        let floating_panes = cx.new(|cx| FloatingPaneLayer::new(center_pane.focus_handle(cx)));
         let toast_layer = cx.new(|_| ToastLayer::new());
         cx.subscribe(
             &modal_layer,
@@ -2100,6 +2104,7 @@ impl Workspace {
             last_active_view_id: None,
             status_bar,
             modal_layer,
+            floating_panes,
             toast_layer,
             titlebar_item: None,
             titlebar_focus_handle: cx.focus_handle(),
@@ -6056,6 +6061,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.active_pane = pane.clone();
+        self.floating_panes.update(cx, |layer, cx| {
+            layer.set_fallback_focus(pane.focus_handle(cx));
+        });
         self.active_item_path_changed(true, window, cx);
         self.last_active_center_pane = Some(pane.downgrade());
     }
@@ -6347,7 +6355,14 @@ impl Workspace {
         &self.active_pane
     }
 
+    pub fn floating_panes(&self) -> &Entity<FloatingPaneLayer> {
+        &self.floating_panes
+    }
+
     pub fn focused_pane(&self, window: &Window, cx: &App) -> Entity<Pane> {
+        if let Some(pane) = self.floating_panes.read(cx).focused_pane(window, cx) {
+            return pane;
+        }
         for dock in self.all_docks() {
             if dock.focus_handle(cx).contains_focused(window, cx)
                 && let Some(pane) = dock
@@ -9696,6 +9711,9 @@ impl Render for Workspace {
                                             this.bounds = bounds;
 
                                             if bounds_changed {
+                                                this.floating_panes.update(cx, |layer, cx| {
+                                                    layer.set_viewport(bounds.size, cx);
+                                                });
                                                 this.left_dock.update(cx, |dock, cx| {
                                                     dock.clamp_panel_size(
                                                         bounds.size.width,
@@ -10058,6 +10076,7 @@ impl Render for Workspace {
                                     }
                                 })
                             }))
+                            .child(self.floating_panes.clone())
                             .children(self.render_notifications(window, cx)),
                     )
                     .when(self.status_bar_visible(cx), |parent| {

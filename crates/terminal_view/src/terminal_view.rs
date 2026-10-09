@@ -1,3 +1,4 @@
+mod floating_terminal;
 mod persistence;
 pub mod terminal_element;
 pub mod terminal_panel;
@@ -107,6 +108,7 @@ pub struct RenameTerminal;
 
 pub fn init(cx: &mut App) {
     terminal_panel::init(cx);
+    floating_terminal::init(cx);
 
     register_serializable_item::<TerminalView>(cx);
 

@@ -1516,6 +1516,20 @@ pub fn new_terminal_pane(
     window: &mut Window,
     cx: &mut Context<TerminalPanel>,
 ) -> Entity<Pane> {
+    let pane = build_terminal_pane(workspace, project, zoomed, window, cx);
+    cx.subscribe_in(&pane, window, TerminalPanel::handle_pane_event)
+        .detach();
+    cx.observe(&pane, |_, _, cx| cx.notify()).detach();
+    pane
+}
+
+pub(crate) fn build_terminal_pane(
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    zoomed: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Pane> {
     let pane = cx.new(|cx| {
         let can_drop_predicate =
             terminal_pane_can_drop_predicate(cx.weak_entity(), project.clone());
@@ -1547,10 +1561,6 @@ pub fn new_terminal_pane(
 
         pane
     });
-
-    cx.subscribe_in(&pane, window, TerminalPanel::handle_pane_event)
-        .detach();
-    cx.observe(&pane, |_, _, cx| cx.notify()).detach();
 
     pane
 }
