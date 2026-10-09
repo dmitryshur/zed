@@ -6,7 +6,9 @@ use collections::HashMap;
 use file_content::decode_text;
 use git::{
     Oid,
-    repository::{Branch, GitRepository, RepoPath, is_binary_content},
+    repository::{
+        Branch, CommitDetails, CommitFileStatus, GitRepository, RepoPath, is_binary_content,
+    },
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
 };
 use gpui::{
@@ -16,7 +18,9 @@ use gpui::{
 use language::{Buffer, Capability};
 use project::{
     Project,
-    git_store::{LocalRepositoryState, Repository, RepositoryEvent, RepositoryState},
+    git_store::{
+        CommitDiff, CommitFile, LocalRepositoryState, Repository, RepositoryEvent, RepositoryState,
+    },
 };
 use util::{ResultExt as _, paths::PathStyle};
 
@@ -148,8 +152,25 @@ pub(crate) struct ComparisonEntry {
 pub(crate) enum OldSide {
     Absent,
     Blob(Oid),
-    /// `git diff --merge-base` skips conflicted paths, so their merge-base blob is unknown.
+    /// No old blob ID is available for conflicted paths or preloaded commit snapshots.
     Unknown,
+}
+
+pub(crate) struct CompareLocation {
+    pub(crate) repo_path: RepoPath,
+    pub(crate) row: u32,
+}
+
+enum ComparisonSource {
+    Branches {
+        base: Branch,
+        compared: Branch,
+    },
+    Commit {
+        sha: Oid,
+        title: SharedString,
+        files: HashMap<RepoPath, Arc<CommitFile>>,
+    },
 }
 
 pub(crate) enum ComparisonEvent {
@@ -168,15 +189,14 @@ pub(crate) struct LoadedCompareFile {
 pub(crate) struct BranchComparison {
     project: Entity<Project>,
     repository: Entity<Repository>,
-    base: Branch,
-    compared: Branch,
+    source: ComparisonSource,
     git_objects: Option<LocalGitObjects>,
     mode: ComparisonMode,
     state: ComparisonState,
     /// The mode and commits the loaded entries were computed for.
     loaded_for: Option<(ComparisonMode, [Oid; 2])>,
     refresh_task: Task<()>,
-    _repository_subscription: Subscription,
+    _repository_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<ComparisonEvent> for BranchComparison {}
@@ -207,21 +227,77 @@ impl BranchComparison {
         let mut this = Self {
             project,
             repository,
-            base,
-            compared,
+            source: ComparisonSource::Branches { base, compared },
             git_objects: None,
             mode,
             state: ComparisonState::Loading,
             loaded_for: None,
             refresh_task: Task::ready(()),
-            _repository_subscription: repository_subscription,
+            _repository_subscription: Some(repository_subscription),
         };
         this.schedule_refresh(Duration::ZERO, cx);
         this
     }
 
+    pub(crate) fn for_commit(
+        project: Entity<Project>,
+        repository: Entity<Repository>,
+        sha: Oid,
+        details: CommitDetails,
+        diff: CommitDiff,
+    ) -> Self {
+        let title = format!(
+            "{}: {}",
+            sha.display_short(),
+            details.message.lines().next().unwrap_or_default()
+        )
+        .into();
+        let mut entries = Vec::with_capacity(diff.files.len());
+        let files = diff
+            .files
+            .into_iter()
+            .map(|file| {
+                let status_code = match file.status() {
+                    CommitFileStatus::Added => StatusCode::Added,
+                    CommitFileStatus::Modified => StatusCode::Modified,
+                    CommitFileStatus::Deleted => StatusCode::Deleted,
+                };
+                entries.push(ComparisonEntry {
+                    repo_path: file.path.clone(),
+                    status: FileStatus::Tracked(TrackedStatus {
+                        index_status: status_code,
+                        worktree_status: status_code,
+                    }),
+                    old_side: if file.old_text.is_some() {
+                        OldSide::Unknown
+                    } else {
+                        OldSide::Absent
+                    },
+                });
+                (file.path.clone(), Arc::new(file))
+            })
+            .collect();
+        entries.sort_by(|left, right| left.repo_path.cmp(&right.repo_path));
+        Self {
+            project,
+            repository,
+            source: ComparisonSource::Commit { sha, title, files },
+            git_objects: None,
+            mode: ComparisonMode::Committed,
+            state: ComparisonState::Loaded(entries.into()),
+            loaded_for: None,
+            refresh_task: Task::ready(()),
+            _repository_subscription: None,
+        }
+    }
+
     pub(crate) fn title(&self) -> SharedString {
-        format!("{} since {}", self.compared.name(), self.base.name()).into()
+        match &self.source {
+            ComparisonSource::Branches { base, compared } => {
+                format!("{} since {}", compared.name(), base.name()).into()
+            }
+            ComparisonSource::Commit { title, .. } => title.clone(),
+        }
     }
 
     pub(crate) fn state(&self) -> &ComparisonState {
@@ -233,8 +309,12 @@ impl BranchComparison {
     }
 
     pub(crate) fn compared_commit(&self) -> Option<Oid> {
-        self.loaded_for
-            .map(|(_, [_, compared_commit])| compared_commit)
+        match &self.source {
+            ComparisonSource::Branches { .. } => self
+                .loaded_for
+                .map(|(_, [_, compared_commit])| compared_commit),
+            ComparisonSource::Commit { sha, .. } => Some(*sha),
+        }
     }
 
     fn mode_for(repository: &Entity<Repository>, compared: &Branch, cx: &App) -> ComparisonMode {
@@ -257,8 +337,13 @@ impl BranchComparison {
             }
             if let Err(error) = Self::refresh(this.clone(), cx).await {
                 this.update(cx, |this, cx| {
-                    this.state =
-                        ComparisonState::Failed(friendly_error(&error, &this.base, &this.compared));
+                    let message = match &this.source {
+                        ComparisonSource::Branches { base, compared } => {
+                            friendly_error(&error, base, compared)
+                        }
+                        ComparisonSource::Commit { .. } => format!("{error:#}").into(),
+                    };
+                    this.state = ComparisonState::Failed(message);
                     this.loaded_for = None;
                     cx.emit(ComparisonEvent::EntriesChanged);
                     cx.notify();
@@ -269,13 +354,16 @@ impl BranchComparison {
     }
 
     async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
-        let (git_objects, base, compared) = this.update(cx, |this, _| {
-            (
-                this.git_objects.clone(),
-                this.base.clone(),
-                this.compared.clone(),
-            )
-        })?;
+        let Some((git_objects, base, compared)) =
+            this.update(cx, |this, _| match &this.source {
+                ComparisonSource::Branches { base, compared } => {
+                    Some((this.git_objects.clone(), base.clone(), compared.clone()))
+                }
+                ComparisonSource::Commit { .. } => None,
+            })?
+        else {
+            return Ok(());
+        };
         let git_objects = match git_objects {
             Some(git_objects) => git_objects,
             None => {
@@ -291,7 +379,7 @@ impl BranchComparison {
         let commits = git_objects.resolve_commits([&base, &compared]).await?;
         let [base_commit, compared_commit] = commits;
         let (mode, already_loaded) = this.update(cx, |this, cx| {
-            let mode = Self::mode_for(&this.repository, &this.compared, cx);
+            let mode = Self::mode_for(&this.repository, &compared, cx);
             if mode != this.mode {
                 this.mode = mode;
                 cx.emit(ComparisonEvent::ModeChanged);
@@ -409,24 +497,49 @@ impl BranchComparison {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<LoadedCompareFile>> {
-        let (Some(git_objects), Some(compared_commit)) =
-            (self.git_objects.clone(), self.compared_commit())
-        else {
-            return Task::ready(Err(anyhow!("the comparison hasn't loaded yet")));
-        };
         let repo_path = entry.repo_path.clone();
         let is_deleted = entry.status.is_deleted();
-        let old_blob = match entry.old_side {
-            OldSide::Blob(oid) => Some(oid),
-            OldSide::Absent | OldSide::Unknown => None,
+        let texts = match &self.source {
+            ComparisonSource::Commit { files, .. } => {
+                let Some(file) = files.get(&repo_path) else {
+                    return Task::ready(Err(anyhow!("the file is not part of this commit")));
+                };
+                let text = |contents: &Option<String>| {
+                    contents.as_ref().map(|contents| {
+                        if file.is_binary {
+                            FileText::Binary
+                        } else {
+                            FileText::Text(contents.clone())
+                        }
+                    })
+                };
+                Task::ready(Ok(FileTexts {
+                    old: text(&file.old_text),
+                    new: text(&file.new_text),
+                }))
+            }
+            ComparisonSource::Branches { .. } => {
+                let (Some(git_objects), Some(compared_commit)) =
+                    (self.git_objects.clone(), self.compared_commit())
+                else {
+                    return Task::ready(Err(anyhow!("the comparison hasn't loaded yet")));
+                };
+                let old_blob = match entry.old_side {
+                    OldSide::Blob(oid) => Some(oid),
+                    OldSide::Absent | OldSide::Unknown => None,
+                };
+                let new_revision =
+                    (!is_deleted).then(|| format!("{compared_commit}:{}", repo_path.as_unix_str()));
+                cx.background_spawn(
+                    async move { git_objects.load_texts(old_blob, new_revision).await },
+                )
+            }
         };
-        let new_revision =
-            (!is_deleted).then(|| format!("{compared_commit}:{}", repo_path.as_unix_str()));
         let project = self.project.clone();
         let repository = self.repository.clone();
         let language_registry = project.read(cx).languages().clone();
         window.spawn(cx, async move |cx| {
-            let texts = git_objects.load_texts(old_blob, new_revision).await?;
+            let texts = texts.await?;
             let is_binary = matches!(texts.old, Some(FileText::Binary))
                 || matches!(texts.new, Some(FileText::Binary));
             let text = |file_text: Option<FileText>| match file_text {

@@ -80,6 +80,9 @@ pub struct FakeGitRepositoryState {
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
+    pub commit_diffs: HashMap<Oid, Arc<git::repository::CommitDiff>>,
+    pub commit_diff_read_gate: Option<FakeBlobReadGate>,
+    pub simulated_commit_diff_error: Option<String>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
@@ -108,6 +111,9 @@ impl FakeGitRepositoryState {
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
             commit_data: Default::default(),
+            commit_diffs: Default::default(),
+            commit_diff_read_gate: None,
+            simulated_commit_diff_error: None,
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
@@ -286,14 +292,49 @@ impl GitRepository for FakeGitRepository {
 
     fn load_commit(
         &self,
-        _commit: String,
+        commit: String,
         _ignore_shallow_boundary: bool,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
-        async {
-            Ok(git::repository::CommitDiff {
-                files: Vec::new(),
-                is_shallow_boundary: false,
+        let state = self.with_state_async(false, move |state| {
+            if let Some(error) = &state.simulated_commit_diff_error {
+                bail!("{error}");
+            }
+            let sha = state
+                .refs
+                .get(&commit)
+                .unwrap_or(&commit)
+                .parse::<Oid>()
+                .ok();
+            Ok((
+                sha,
+                sha.and_then(|sha| state.commit_diffs.get(&sha).cloned()),
+                state.commit_diff_read_gate.clone(),
+            ))
+        });
+        async move {
+            let (sha, diff, gate) = state.await?;
+            if let (Some(gate), Some(sha)) = (gate, sha) {
+                gate.wait(sha).await;
+            }
+            Ok(match diff {
+                Some(diff) => git::repository::CommitDiff {
+                    files: diff
+                        .files
+                        .iter()
+                        .map(|file| git::repository::CommitFile {
+                            path: file.path.clone(),
+                            old_content: file.old_content.clone(),
+                            new_content: file.new_content.clone(),
+                            is_binary: file.is_binary,
+                        })
+                        .collect(),
+                    is_shallow_boundary: diff.is_shallow_boundary,
+                },
+                None => git::repository::CommitDiff {
+                    files: Vec::new(),
+                    is_shallow_boundary: false,
+                },
             })
         }
         .boxed()

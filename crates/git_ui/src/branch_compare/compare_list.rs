@@ -7,8 +7,9 @@ use file_icons::FileIcons;
 use fuzzy_nucleo::{Case, LengthPenalty, StringMatchCandidate};
 use git::{Oid, repository::RepoPath};
 use gpui::{
-    Action as _, AppContext as _, Context, Entity, Focusable as _, ScrollStrategy, SharedString,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, point, uniform_list,
+    Action as _, AppContext as _, Context, Entity, FocusHandle, Focusable as _, ScrollStrategy,
+    SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window,
+    point, uniform_list,
 };
 use settings::Settings as _;
 use ui::{IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*};
@@ -19,8 +20,8 @@ use super::{
     ClearCompareFilter, CompareBranches,
     compare_diff_view::CompareDiffView,
     comparison::{
-        BranchComparison, ComparisonEntry, ComparisonEvent, ComparisonMode, ComparisonState,
-        LoadedCompareFile,
+        BranchComparison, CompareLocation, ComparisonEntry, ComparisonEvent, ComparisonMode,
+        ComparisonState, LoadedCompareFile,
     },
     file_tree::{CompareRow, build_rows},
 };
@@ -70,7 +71,19 @@ struct ComparedFile {
 
 struct LoadingFile {
     file: ComparedFile,
-    activate_when_loaded: bool,
+    activation: Option<ActivationRequest>,
+    focus_when_loaded: Option<FocusRequest>,
+    initial_row: Option<u32>,
+}
+
+struct ActivationRequest {
+    origin: Option<WeakFocusHandle>,
+    active_item: Option<gpui::EntityId>,
+}
+
+struct FocusRequest {
+    origin: WeakFocusHandle,
+    _subscription: Subscription,
 }
 
 /// The contents of the git panel's Compare tab: the files of a branch comparison, as a tree. The
@@ -86,7 +99,9 @@ pub(crate) struct CompareList {
     filter_query: String,
     filter_visible: bool,
     selected_row: Option<usize>,
+    confirmed_file: Option<RepoPath>,
     initial_file_pending: bool,
+    initial_location: Option<CompareLocation>,
     /// The number of rows in the last render, which the page size is measured against.
     rendered_row_count: usize,
     scroll_handle: UniformListScrollHandle,
@@ -94,6 +109,8 @@ pub(crate) struct CompareList {
     loading_file: Option<LoadingFile>,
     shown: Option<ComparedFile>,
     file_load_task: Task<()>,
+    blame_commit_task: Task<()>,
+    _blame_lookup_subscription: Option<Subscription>,
     _comparison_subscription: Option<Subscription>,
     _filter_subscriptions: Vec<Subscription>,
 }
@@ -111,13 +128,17 @@ impl CompareList {
             filter_query: String::new(),
             filter_visible: false,
             selected_row: None,
+            confirmed_file: None,
             initial_file_pending: false,
+            initial_location: None,
             rendered_row_count: 0,
             scroll_handle: UniformListScrollHandle::new(),
             diff_view: WeakEntity::new_invalid(),
             loading_file: None,
             shown: None,
             file_load_task: Task::ready(()),
+            blame_commit_task: Task::ready(()),
+            _blame_lookup_subscription: None,
             _comparison_subscription: None,
             _filter_subscriptions: Vec::new(),
         }
@@ -129,6 +150,8 @@ impl CompareList {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_blame_commit_lookup();
+        self.initial_location = None;
         self._comparison_subscription = comparison.as_ref().map(|comparison| {
             cx.subscribe_in(comparison, window, |this, _, event, window, cx| {
                 this.handle_comparison_event(event, window, cx);
@@ -146,10 +169,46 @@ impl CompareList {
             editor.update(cx, |editor, cx| editor.set_text("", window, cx));
         }
         self.selected_row = None;
+        self.confirmed_file = None;
         self.loading_file = None;
         self.shown = None;
         self.file_load_task = Task::ready(());
         cx.notify();
+    }
+
+    pub(crate) fn cancel_blame_commit_lookup(&mut self) {
+        self._blame_lookup_subscription = None;
+        self.blame_commit_task = Task::ready(());
+    }
+
+    pub(crate) fn set_blame_commit_task(
+        &mut self,
+        task: Task<()>,
+        origin: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_blame_commit_lookup();
+        self.blame_commit_task = task;
+        self._blame_lookup_subscription = Some(cx.on_focus_out(origin, window, |list, _, _, _| {
+            list.cancel_blame_commit_lookup();
+        }));
+    }
+
+    pub(crate) fn finish_blame_commit_lookup(&mut self) {
+        self._blame_lookup_subscription = None;
+    }
+
+    pub(crate) fn set_commit_comparison(
+        &mut self,
+        comparison: Entity<BranchComparison>,
+        location: CompareLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_comparison(Some(comparison), window, cx);
+        self.initial_location = Some(location);
+        self.handle_comparison_event(&ComparisonEvent::EntriesChanged, window, cx);
     }
 
     fn rebuild_rows(&mut self) {
@@ -179,6 +238,7 @@ impl CompareList {
     }
 
     pub(crate) fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         let editor = match &self.filter_editor {
             Some(editor) => editor.clone(),
             None => {
@@ -220,6 +280,7 @@ impl CompareList {
     }
 
     pub(crate) fn finish_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         if self.has_filter() {
             self.filter_visible = true;
             cx.notify();
@@ -229,6 +290,7 @@ impl CompareList {
     }
 
     pub(crate) fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         self.update_filter(String::new(), cx);
         self.filter_visible = false;
         if let Some(editor) = &self.filter_editor {
@@ -238,6 +300,7 @@ impl CompareList {
     }
 
     fn update_filter(&mut self, query: String, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         let query = query.trim().to_string();
         if self.filter_query == query {
             return;
@@ -324,14 +387,23 @@ impl CompareList {
                     .map(|row| row.min(self.rows.len().saturating_sub(1)))
                     .filter(|_| !self.rows.is_empty())
             }),
-            None => first_file_row,
+            None => self
+                .initial_location
+                .as_ref()
+                .and_then(|location| self.row_index(&RowKey::File(location.repo_path.clone())))
+                .or(first_file_row),
         };
 
         if loaded {
             if self.initial_file_pending {
                 self.initial_file_pending = false;
                 if let Some(entry) = self.selected_entry() {
-                    self.load_file(entry, true, window, cx);
+                    let activation = self.activation_request(window, cx);
+                    self.load_file(entry, Some(activation), None, window, cx);
+                }
+                if let Some(row) = self.selected_row {
+                    self.scroll_handle
+                        .scroll_to_item(row, ScrollStrategy::Nearest);
                 }
             } else {
                 self.refresh_displayed_file(window, cx);
@@ -341,8 +413,8 @@ impl CompareList {
     }
 
     fn refresh_displayed_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (file, activate) = match &self.loading_file {
-            Some(loading) => (&loading.file, loading.activate_when_loaded),
+        let file = match &self.loading_file {
+            Some(loading) => &loading.file,
             None => {
                 let Some(file) = self.shown.as_ref() else {
                     return;
@@ -350,7 +422,7 @@ impl CompareList {
                 if self.existing_diff_view(cx).is_none() {
                     return;
                 }
-                (file, false)
+                file
             }
         };
         let Some(entry) = self
@@ -371,7 +443,15 @@ impl CompareList {
             mode: comparison.mode(),
         };
         if file != &updated_file {
-            self.load_file(entry, activate, window, cx);
+            let focus = self
+                .loading_file
+                .as_mut()
+                .and_then(|loading| loading.focus_when_loaded.take());
+            let activation = self
+                .loading_file
+                .as_mut()
+                .and_then(|loading| loading.activation.take());
+            self.load_file(entry, activation, focus, window, cx);
         }
     }
 
@@ -431,6 +511,7 @@ impl CompareList {
         direction: VerticalDirection,
         cx: &mut Context<Self>,
     ) {
+        self.reset_confirmation();
         let state = self.scroll_handle.0.borrow();
         let Some(item_size) = state.last_item_size else {
             return;
@@ -466,6 +547,7 @@ impl CompareList {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reset_confirmation();
         let (Some(comparison), Some(view)) = (self.comparison.as_ref(), self.diff_view.upgrade())
         else {
             return;
@@ -513,6 +595,7 @@ impl CompareList {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reset_confirmation();
         let count = self.rows.len();
         if count == 0 {
             return;
@@ -530,6 +613,27 @@ impl CompareList {
     }
 
     pub(crate) fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected_path = self.selected_entry().map(|entry| entry.repo_path);
+        let focus_editor = selected_path.as_ref().is_some_and(|path| {
+            self.confirmed_file.as_ref() == Some(path)
+                && (self
+                    .loading_file
+                    .as_ref()
+                    .is_some_and(|loading| &loading.file.entry.repo_path == path)
+                    || self
+                        .existing_diff_view(cx)
+                        .is_some_and(|view| view.read(cx).shown_path() == Some(path)))
+        });
+        self.confirmed_file = selected_path;
+        self.confirm_selected(focus_editor, window, cx);
+    }
+
+    fn confirm_selected(
+        &mut self,
+        focus_editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(CompareRow::Directory { path, .. }) =
             self.selected_row.and_then(|row| self.rows.get(row))
         {
@@ -540,10 +644,17 @@ impl CompareList {
         let Some(selected_entry) = self.selected_entry() else {
             return;
         };
+        let focus = if focus_editor {
+            Self::focus_request(window, cx)
+        } else {
+            None
+        };
+        let activation = self.activation_request(window, cx);
         if let Some(loading) = self.loading_file.as_mut()
             && loading.file.entry.repo_path == selected_entry.repo_path
         {
-            loading.activate_when_loaded = true;
+            loading.activation = Some(activation);
+            loading.focus_when_loaded = focus;
             return;
         }
         if self.loading_file.take().is_some() {
@@ -556,16 +667,46 @@ impl CompareList {
             Some(view) => {
                 if let Some(workspace) = self.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
-                        workspace.activate_item(&view, false, false, window, cx);
+                        workspace.activate_item(&view, focus_editor, focus_editor, window, cx);
                     });
                 }
             }
-            None => self.load_file(selected_entry, true, window, cx),
+            None => self.load_file(selected_entry, Some(activation), focus, window, cx),
         }
+    }
+
+    fn reset_confirmation(&mut self) {
+        self.confirmed_file = None;
+        if let Some(loading) = self.loading_file.as_mut() {
+            loading.focus_when_loaded = None;
+        }
+    }
+
+    fn activation_request(&self, window: &Window, cx: &gpui::App) -> ActivationRequest {
+        ActivationRequest {
+            origin: window.focused(cx).map(|focus| focus.downgrade()),
+            active_item: self.workspace.upgrade().and_then(|workspace| {
+                workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .map(|item| item.item_id())
+            }),
+        }
+    }
+
+    fn focus_request(window: &mut Window, cx: &mut Context<Self>) -> Option<FocusRequest> {
+        let origin = window.focused(cx)?;
+        let subscription =
+            cx.on_focus_out(&origin, window, |list, _, _, _| list.reset_confirmation());
+        Some(FocusRequest {
+            origin: origin.downgrade(),
+            _subscription: subscription,
+        })
     }
 
     /// Opens a collapsed folder; otherwise moves to the next row.
     pub(crate) fn expand_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         if let Some(CompareRow::Directory {
             path,
             expanded: false,
@@ -582,6 +723,7 @@ impl CompareList {
     /// Closes the selected folder or the nearest open folder above the selection, and selects it;
     /// otherwise moves to the previous row.
     pub(crate) fn collapse_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         let Some(selected_row) = self.selected_row else {
             return;
         };
@@ -621,6 +763,7 @@ impl CompareList {
 
     /// Collapses or expands a folder and selects it.
     fn toggle_directory(&mut self, path: RepoPath, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         let collapsed = if self.has_filter() {
             &mut self.filtered_collapsed_directories
         } else {
@@ -639,17 +782,19 @@ impl CompareList {
     }
 
     fn select_and_confirm(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_confirmation();
         if self.selected_row != Some(row) {
             self.selected_row = Some(row);
         }
-        self.confirm(window, cx);
+        self.confirm_selected(false, window, cx);
         cx.notify();
     }
 
     fn load_file(
         &mut self,
         entry: ComparisonEntry,
-        activate: bool,
+        activation: Option<ActivationRequest>,
+        focus: Option<FocusRequest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -662,7 +807,13 @@ impl CompareList {
                 compared_commit: comparison.read(cx).compared_commit(),
                 mode: comparison.read(cx).mode(),
             },
-            activate_when_loaded: activate,
+            activation,
+            focus_when_loaded: focus,
+            initial_row: self
+                .initial_location
+                .take()
+                .filter(|location| location.repo_path == entry.repo_path)
+                .map(|location| location.row),
         });
         self.file_load_task = cx.spawn_in(window, async move |this, cx| {
             let Ok(load) = this.update_in(cx, |_, window, cx| {
@@ -693,7 +844,20 @@ impl CompareList {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let view = if loading.activate_when_loaded {
+        let activate = loading.activation.as_ref().is_some_and(|request| {
+            let origin_contains_focus = request.origin.as_ref().is_none_or(|origin| {
+                origin
+                    .upgrade()
+                    .is_some_and(|origin| origin.contains_focused(window, cx))
+            });
+            origin_contains_focus
+                && workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .map(|item| item.item_id())
+                    == request.active_item
+        });
+        let view = if activate {
             self.diff_view_or_create(&workspace, window, cx)
         } else {
             let Some(view) = self.existing_diff_view(cx) else {
@@ -703,14 +867,25 @@ impl CompareList {
         };
         let comparison = comparison.read(cx);
         let title = comparison.title();
+        let focus_editor = result.is_ok()
+            && loading
+                .focus_when_loaded
+                .as_ref()
+                .and_then(|request| request.origin.upgrade())
+                .is_some_and(|origin| origin.is_focused(window));
         self.shown = Some(loading.file);
         view.update(cx, |view, cx| match result {
-            Ok(file) => view.show_file(file, title, window, cx),
+            Ok(file) => {
+                view.show_file(file, title, window, cx);
+                if let Some(row) = loading.initial_row {
+                    view.reveal_row(row, window, cx);
+                }
+            }
             Err(error) => view.show_error(format!("{error:#}").into(), title, cx),
         });
-        if loading.activate_when_loaded {
+        if activate {
             workspace.update(cx, |workspace, cx| {
-                workspace.activate_item(&view, false, false, window, cx);
+                workspace.activate_item(&view, focus_editor, focus_editor, window, cx);
             });
         }
     }
@@ -981,7 +1156,8 @@ mod tests {
     };
     use editor::{DiffViewStyle, Editor, ScrollBeyondLastLine};
     use gpui::{
-        KeyBinding, KeyBindingContextPredicate, Modifiers, TestAppContext, VisualTestContext, size,
+        KeyBinding, KeyBindingContextPredicate, Modifiers, TestAppContext, UpdateGlobal,
+        VisualTestContext, size,
     };
     use settings::{KeymapFile, SettingsStore};
     use std::time::Duration;
@@ -1001,6 +1177,10 @@ mod tests {
             view.shown_path()
                 .map(|repo_path| repo_path.as_unix_str().to_string())
         })
+    }
+
+    fn diff_has_focus(view: &Entity<CompareDiffView>, cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| view.focus_handle(cx).contains_focused(window, cx))
     }
 
     fn bind_compare_keys(cx: &mut VisualTestContext) {
@@ -1043,6 +1223,709 @@ mod tests {
 
     fn editor_scroll_y(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> f64 {
         editor.update_in(cx, |editor, _, cx| editor.scroll_position(cx).y)
+    }
+
+    struct NormalModeContext;
+
+    impl editor::Addon for NormalModeContext {
+        fn extend_key_context(&self, context: &mut gpui::KeyContext, _: &gpui::App) {
+            context.add("VimControl");
+            context.set("vim_mode", "normal");
+        }
+
+        fn to_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct BlameCompareTest {
+        workspace: Entity<Workspace>,
+        panel: Entity<GitPanel>,
+        source: Entity<Editor>,
+        project: Entity<project::Project>,
+        repository: Entity<project::git_store::Repository>,
+        fs: std::sync::Arc<fs::FakeFs>,
+        cx: VisualTestContext,
+    }
+
+    fn blame_entry(sha: git::Oid, filename: &str) -> git::blame::BlameEntry {
+        git::blame::BlameEntry {
+            sha,
+            filename: filename.into(),
+            range: 2..6,
+            original_line_number: 80,
+            author: None,
+            author_mail: None,
+            author_time: None,
+            author_tz: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+            committer_tz: None,
+            summary: Some("Change historical lines".into()),
+            previous: None,
+            boundary: false,
+        }
+    }
+
+    fn set_commit_fixture(fs: &fs::FakeFs, sha: git::Oid, shallow: bool) {
+        let new_text = (0..160)
+            .map(|row| format!("committed line {row}\n"))
+            .collect::<String>();
+        let old_text = new_text.replace("committed line 8", "previous line 8");
+        fs.with_git_state(
+            std::path::Path::new(util::path!("/project/.git")),
+            false,
+            |state| {
+                state.commit_diffs.insert(
+                    sha,
+                    std::sync::Arc::new(git::repository::CommitDiff {
+                        files: vec![
+                            git::repository::CommitFile {
+                                path: RepoPath::new("aaa/new.rs").expect("valid path"),
+                                old_content: None,
+                                new_content: Some(b"added\n".to_vec()),
+                                is_binary: false,
+                            },
+                            git::repository::CommitFile {
+                                path: RepoPath::new("src/old.rs").expect("valid path"),
+                                old_content: Some(old_text.into_bytes()),
+                                new_content: Some(new_text.into_bytes()),
+                                is_binary: false,
+                            },
+                            git::repository::CommitFile {
+                                path: RepoPath::new("zzz/deleted.rs").expect("valid path"),
+                                old_content: Some(b"deleted\n".to_vec()),
+                                new_content: None,
+                                is_binary: false,
+                            },
+                            git::repository::CommitFile {
+                                path: RepoPath::new("zzz/binary.dat").expect("valid path"),
+                                old_content: None,
+                                new_content: Some(vec![0, 1]),
+                                is_binary: true,
+                            },
+                        ],
+                        is_shallow_boundary: shallow,
+                    }),
+                );
+            },
+        )
+        .expect("repository should exist");
+    }
+
+    async fn setup_blame_compare(cx: &mut TestAppContext) -> BlameCompareTest {
+        let (project, repository, fs) = setup("main", cx).await;
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .git
+                    .get_or_insert_default()
+                    .inline_blame
+                    .get_or_insert_default()
+                    .enabled = Some(false);
+            })
+        });
+        let sha = super::super::comparison::tests::FEATURE_SHA
+            .parse()
+            .expect("valid sha");
+        set_commit_fixture(&fs, sha, false);
+        fs.set_blame_for_repo(
+            std::path::Path::new(util::path!("/project/.git")),
+            vec![(
+                RepoPath::new("src/changed.rs").expect("valid path"),
+                git::blame::Blame {
+                    entries: vec![blame_entry(sha, "src/old.rs")],
+                    ..Default::default()
+                },
+            )],
+        );
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(&mut cx, GitPanel::new_test);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx)
+        });
+        let worktree_id = project.read_with(&cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let buffer = project
+            .update(&mut cx, |project, cx| {
+                project.open_buffer(
+                    project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::RelPath::from_unix_str("src/changed.rs")
+                            .expect("valid path")
+                            .into_arc(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("source buffer should open");
+        let source = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+        });
+        source.update_in(&mut cx, |source, window, cx| {
+            source.register_addon(NormalModeContext);
+            source.set_text(
+                "preface\npreface\nline 79\nline 80\nline 81\nline 82\n",
+                window,
+                cx,
+            );
+            let point = language::Point::new(4, 0);
+            source.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([point..point])
+            });
+        });
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(source.clone()), None, true, window, cx);
+        });
+        cx.update(|_, cx| {
+            cx.bind_keys([KeyBinding::new(
+                "space g o",
+                super::super::CompareBlameCommit,
+                Some("VimControl && vim_mode == normal"),
+            )])
+        });
+        bind_compare_keys(&mut cx);
+        cx.run_until_parked();
+        BlameCompareTest {
+            workspace,
+            panel,
+            source,
+            project,
+            repository,
+            fs,
+            cx,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_compare_blame_commit_keyboard_flow(cx: &mut TestAppContext) {
+        for style in [DiffViewStyle::Unified, DiffViewStyle::Split] {
+            let BlameCompareTest {
+                workspace,
+                panel,
+                source,
+                project: _,
+                repository,
+                fs,
+                mut cx,
+            } = setup_blame_compare(cx).await;
+            let cx = &mut cx;
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.editor.diff_view_style = Some(style)
+                    });
+                })
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                start_comparison(
+                    workspace,
+                    repository.clone(),
+                    branch("refs/heads/main"),
+                    branch("refs/heads/feature"),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            let existing = diff_views(&workspace, cx)
+                .into_iter()
+                .next()
+                .expect("branch diff");
+            let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+            list.update_in(cx, |list, window, cx| {
+                list.focus_filter(window, cx);
+                list.update_filter("added".into(), cx);
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&source, true, true, window, cx)
+            });
+            assert!(
+                !source.read_with(cx, |source, _| source.show_git_blame_gutter()
+                    || source.blame().is_some())
+            );
+            cx.simulate_keystrokes("space g o");
+            cx.run_until_parked();
+            assert_eq!(diff_views(&workspace, cx), vec![existing.clone()]);
+            assert_eq!(shown_path(&existing, cx).as_deref(), Some("src/old.rs"));
+            assert!(!diff_has_focus(&existing, cx));
+            assert!(cx.update(|window, cx| panel.focus_handle(cx).contains_focused(window, cx)));
+            assert!(
+                !source.read_with(cx, |source, _| source.show_git_blame_gutter()
+                    || source.blame().is_some())
+            );
+            list.read_with(cx, |list, cx| {
+                assert!(!list.filter_visible);
+                assert_eq!(
+                    list.selected_entry()
+                        .expect("selection")
+                        .repo_path
+                        .as_unix_str(),
+                    "src/old.rs"
+                );
+                assert_eq!(list.entries.len(), 4);
+                assert_eq!(
+                    list.comparison
+                        .as_ref()
+                        .expect("comparison")
+                        .read(cx)
+                        .mode(),
+                    ComparisonMode::Committed
+                );
+            });
+            let editor =
+                existing.read_with(cx, |view, cx| view.editor().read(cx).rhs_editor().clone());
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let cursor = editor
+                    .selections
+                    .newest::<language::Point>(&snapshot.display_snapshot)
+                    .head();
+                let (_, point) = snapshot
+                    .buffer_snapshot()
+                    .point_to_buffer_point(cursor)
+                    .expect("historical buffer point");
+                assert_eq!(point.row, 81);
+                assert!(editor.read_only(cx));
+                assert!(editor.text(cx).contains("committed line 81"));
+            });
+            assert!(editor_scroll_y(&editor, cx) > 0.0);
+            cx.simulate_keystrokes("j j");
+            assert_eq!(shown_path(&existing, cx).as_deref(), Some("src/old.rs"));
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            assert_eq!(shown_path(&existing, cx).as_deref(), Some("zzz/binary.dat"));
+            assert!(editor.read_with(cx, |editor, cx| {
+                editor.text(cx).contains("binary file not shown")
+            }));
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&source, true, true, window, cx)
+            });
+            source.update_in(cx, |source, window, cx| {
+                source.toggle_git_blame(&git::Blame, window, cx)
+            });
+            cx.run_until_parked();
+            let blame = source.read_with(cx, |source, _| source.blame().cloned());
+            cx.simulate_keystrokes("space g o");
+            cx.run_until_parked();
+            assert!(source.read_with(cx, |source, _| source.show_git_blame_gutter()));
+            assert_eq!(
+                source.read_with(cx, |source, _| source.blame().cloned()),
+                blame
+            );
+            assert_eq!(shown_path(&existing, cx).as_deref(), Some("src/old.rs"));
+            assert_eq!(diff_views(&workspace, cx), vec![existing.clone()]);
+            let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+            let comparison =
+                list.read_with(cx, |list, _| list.comparison.clone().expect("comparison"));
+            fs.set_branch_name(
+                std::path::Path::new(util::path!("/project/.git")),
+                Some("feature"),
+            );
+            cx.run_until_parked();
+            assert_eq!(
+                comparison.read_with(cx, |comparison, _| comparison.mode()),
+                ComparisonMode::Committed
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_compare_blame_commit_errors_preserve_comparison(cx: &mut TestAppContext) {
+        let BlameCompareTest {
+            workspace,
+            panel,
+            source,
+            repository,
+            fs,
+            mut cx,
+            ..
+        } = setup_blame_compare(cx).await;
+        let cx = &mut cx;
+        workspace.update_in(cx, |workspace, window, cx| {
+            start_comparison(
+                workspace,
+                repository,
+                branch("refs/heads/main"),
+                branch("refs/heads/feature"),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+        let previous = list.read_with(cx, |list, _| list.comparison.clone().expect("comparison"));
+        let view = diff_views(&workspace, cx).into_iter().next().expect("diff");
+        let previous_path = shown_path(&view, cx);
+        let dot_git = std::path::Path::new(util::path!("/project/.git"));
+        let sha = super::super::comparison::tests::FEATURE_SHA
+            .parse()
+            .expect("valid sha");
+        for failure in ["uncommitted", "empty", "missing_file", "shallow", "error"] {
+            let mut entry = blame_entry(sha, "src/old.rs");
+            if failure == "uncommitted" {
+                entry.sha = git::Oid::from_bytes(&[0; 20]).expect("zero oid");
+            }
+            if failure == "missing_file" {
+                entry.filename = "missing.rs".into();
+            }
+            fs.set_blame_for_repo(
+                dot_git,
+                vec![(
+                    RepoPath::new("src/changed.rs").expect("path"),
+                    git::blame::Blame {
+                        entries: if failure == "empty" {
+                            vec![]
+                        } else {
+                            vec![entry]
+                        },
+                        ..Default::default()
+                    },
+                )],
+            );
+            set_commit_fixture(&fs, sha, failure == "shallow");
+            fs.with_git_state(dot_git, false, |state| {
+                state.simulated_commit_diff_error =
+                    (failure == "error").then(|| "failed to read commit".into())
+            })
+            .expect("repo");
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.clear_all_notifications(cx);
+                workspace.activate_item(&source, true, true, window, cx);
+            });
+            cx.simulate_keystrokes("space g o");
+            cx.run_until_parked();
+            assert_eq!(
+                list.read_with(cx, |list, _| list.comparison.clone()),
+                Some(previous.clone()),
+                "{failure}"
+            );
+            assert_eq!(shown_path(&view, cx), previous_path, "{failure}");
+            assert!(
+                !workspace.read_with(cx, |workspace, _| workspace.notification_ids().is_empty()),
+                "{failure}"
+            );
+            assert!(cx.update(|window, cx| source.focus_handle(cx).contains_focused(window, cx)));
+        }
+        let unsupported = cx.new_window_entity(Editor::multi_line);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.clear_all_notifications(cx);
+            workspace.add_item_to_active_pane(Box::new(unsupported), None, true, window, cx);
+        });
+        cx.dispatch_action(super::super::CompareBlameCommit);
+        cx.run_until_parked();
+        assert_eq!(
+            list.read_with(cx, |list, _| list.comparison.clone()),
+            Some(previous)
+        );
+        assert_eq!(shown_path(&view, cx), previous_path);
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.notification_ids().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_compare_blame_commit_cancelled_lookup(cx: &mut TestAppContext) {
+        let BlameCompareTest {
+            workspace,
+            panel,
+            source,
+            fs,
+            mut cx,
+            ..
+        } = setup_blame_compare(cx).await;
+        let cx = &mut cx;
+        let dot_git = std::path::Path::new(util::path!("/project/.git"));
+        let first_sha = super::super::comparison::tests::FEATURE_SHA
+            .parse()
+            .expect("sha");
+        let second_sha = git::Oid::from_bytes(&[3; 20]).expect("sha");
+        set_commit_fixture(&fs, second_sha, false);
+        let gate = fs::FakeBlobReadGate::default();
+        fs.with_git_state(dot_git, false, |state| {
+            state.commit_diff_read_gate = Some(gate.clone())
+        })
+        .expect("repo");
+        cx.simulate_keystrokes("space g o");
+        cx.run_until_parked();
+        assert!(gate.is_waiting(first_sha));
+        fs.set_blame_for_repo(
+            dot_git,
+            vec![(
+                RepoPath::new("src/changed.rs").expect("path"),
+                git::blame::Blame {
+                    entries: vec![blame_entry(second_sha, "src/old.rs")],
+                    ..Default::default()
+                },
+            )],
+        );
+        cx.simulate_keystrokes("space g o");
+        cx.run_until_parked();
+        assert!(gate.is_waiting(second_sha));
+        assert!(!gate.is_waiting(first_sha));
+        let other = cx.new_window_entity(Editor::multi_line);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(other.clone()), None, true, window, cx)
+        });
+        cx.run_until_parked();
+        gate.open();
+        cx.run_until_parked();
+        assert!(diff_views(&workspace, cx).is_empty());
+        assert!(panel.read_with(cx, |panel, cx| {
+            panel.compare_list().read(cx).comparison.is_none()
+        }));
+        assert!(cx.update(|window, cx| other.focus_handle(cx).contains_focused(window, cx)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&source, true, true, window, cx)
+        });
+        cx.simulate_keystrokes("space g o");
+        cx.run_until_parked();
+        let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+        assert_eq!(
+            list.read_with(cx, |list, cx| list
+                .comparison
+                .as_ref()
+                .expect("comparison")
+                .read(cx)
+                .compared_commit()),
+            Some(second_sha)
+        );
+        let pending = fs::FakeBlobReadGate::default();
+        fs.with_git_state(dot_git, false, |state| {
+            state.commit_diff_read_gate = Some(pending.clone())
+        })
+        .expect("repo");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&source, true, true, window, cx)
+        });
+        cx.simulate_keystrokes("space g o");
+        cx.run_until_parked();
+        assert!(pending.is_waiting(second_sha));
+        list.update_in(cx, |list, window, cx| list.set_comparison(None, window, cx));
+        cx.run_until_parked();
+        pending.open();
+        cx.run_until_parked();
+        assert!(list.read_with(cx, |list, _| list.comparison.is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_compare_blame_commit_from_excerpts_uses_cursor_repository(
+        cx: &mut TestAppContext,
+    ) {
+        let BlameCompareTest {
+            workspace,
+            panel,
+            source,
+            project,
+            fs,
+            mut cx,
+            ..
+        } = setup_blame_compare(cx).await;
+        let cx = &mut cx;
+        let other_dot_git = std::path::Path::new(util::path!("/other/.git"));
+        fs.insert_tree(
+            util::path!("/other"),
+            serde_json::json!({ ".git": {}, "other.rs": "a\nb\nc\nd\ne\nf\n" }),
+        )
+        .await;
+        let sha = git::Oid::from_bytes(&[4; 20]).expect("sha");
+        fs.set_head_for_repo(
+            other_dot_git,
+            &[("other.rs", "a\nb\nc\nd\ne\nf\n".into())],
+            sha.to_string(),
+        );
+        fs.set_blame_for_repo(
+            other_dot_git,
+            vec![(
+                RepoPath::new("other.rs").expect("path"),
+                git::blame::Blame {
+                    entries: vec![blame_entry(sha, "src/old.rs")],
+                    ..Default::default()
+                },
+            )],
+        );
+        let first_sha = super::super::comparison::tests::FEATURE_SHA
+            .parse()
+            .expect("sha");
+        let diff = fs
+            .with_git_state(
+                std::path::Path::new(util::path!("/project/.git")),
+                false,
+                |state| state.commit_diffs.get(&first_sha).expect("fixture").clone(),
+            )
+            .expect("repo");
+        fs.with_git_state(other_dot_git, false, |state| {
+            state.commit_diffs.insert(sha, diff);
+        })
+        .expect("repo");
+        let (other_worktree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(util::path!("/other"), true, cx)
+            })
+            .await
+            .expect("other worktree");
+        cx.run_until_parked();
+        let other_worktree_id = other_worktree.read_with(cx, |worktree, _| worktree.id());
+        let other_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(
+                    project::ProjectPath {
+                        worktree_id: other_worktree_id,
+                        path: util::rel_path::RelPath::from_unix_str("other.rs")
+                            .expect("path")
+                            .into_arc(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("other buffer");
+        let source_buffer = source.read_with(cx, |source, cx| {
+            source.buffer().read(cx).as_singleton().expect("source")
+        });
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = multi_buffer::MultiBuffer::new(language::Capability::ReadWrite);
+            multibuffer.set_excerpts_for_buffer(
+                source_buffer,
+                [language::Point::zero()..language::Point::new(5, 0)],
+                0,
+                cx,
+            );
+            multibuffer.set_excerpts_for_buffer(
+                other_buffer.clone(),
+                [language::Point::new(2, 0)..language::Point::new(5, 0)],
+                0,
+                cx,
+            );
+            multibuffer
+        });
+        let excerpt_editor = cx.new_window_entity(|window, cx| {
+            Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx)
+        });
+        excerpt_editor.update_in(cx, |editor, window, cx| {
+            editor.register_addon(NormalModeContext);
+            let text_anchor = other_buffer
+                .read(cx)
+                .anchor_before(language::Point::new(4, 0));
+            let anchor = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_in_buffer(text_anchor)
+                .expect("excerpt anchor");
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([anchor..anchor])
+            });
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(excerpt_editor), None, true, window, cx)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            let editor = workspace
+                .active_item_as::<Editor>(cx)
+                .expect("excerpt editor");
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let cursor = editor
+                    .selections
+                    .newest::<language::Point>(&snapshot.display_snapshot)
+                    .head();
+                let (_, point) = snapshot
+                    .buffer_snapshot()
+                    .point_to_buffer_point(cursor)
+                    .expect("buffer point");
+                assert_eq!(point.row, 4, "source excerpt cursor");
+            });
+        });
+        cx.simulate_keystrokes("space g o");
+        cx.run_until_parked();
+        let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+        assert_eq!(
+            list.read_with(cx, |list, cx| list
+                .comparison
+                .as_ref()
+                .expect("comparison")
+                .read(cx)
+                .compared_commit()),
+            Some(sha)
+        );
+        let view = diff_views(&workspace, cx).into_iter().next().expect("diff");
+        let editor = view.read_with(cx, |view, cx| view.editor().read(cx).rhs_editor().clone());
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let cursor = editor
+                .selections
+                .newest::<language::Point>(&snapshot.display_snapshot)
+                .head();
+            let (_, point) = snapshot
+                .buffer_snapshot()
+                .point_to_buffer_point(cursor)
+                .expect("historical buffer point");
+            assert_eq!(point.row, 81);
+            assert_eq!(
+                editor
+                    .file_at(editor.selections.newest_anchor().head(), cx)
+                    .expect("file")
+                    .worktree_id(cx),
+                other_worktree_id
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compare_blame_commit_added_and_deleted_snapshots(cx: &mut TestAppContext) {
+        let BlameCompareTest { panel, mut cx, .. } = setup_blame_compare(cx).await;
+        let cx = &mut cx;
+        cx.simulate_keystrokes("space g o");
+        cx.run_until_parked();
+        let comparison = panel.read_with(cx, |panel, cx| {
+            panel
+                .compare_list()
+                .read(cx)
+                .comparison
+                .clone()
+                .expect("comparison")
+        });
+        for (path, new_text, old_text) in [
+            ("aaa/new.rs", "added\n", None),
+            ("zzz/deleted.rs", "", Some("deleted\n")),
+        ] {
+            let entry = comparison.read_with(cx, |comparison, _| {
+                let ComparisonState::Loaded(entries) = comparison.state() else {
+                    panic!("commit should be loaded");
+                };
+                entries
+                    .iter()
+                    .find(|entry| entry.repo_path.as_unix_str() == path)
+                    .expect("entry")
+                    .clone()
+            });
+            let loaded = comparison
+                .update_in(cx, |comparison, window, cx| {
+                    comparison.load_file(&entry, window, cx)
+                })
+                .await
+                .expect("snapshot should load");
+            assert!(loaded.read_only);
+            loaded.buffer.read_with(cx, |buffer, _| {
+                assert_eq!(buffer.text(), new_text);
+                assert_eq!(buffer.capability(), language::Capability::ReadOnly);
+            });
+            loaded.diff.read_with(cx, |diff, cx| {
+                assert_eq!(diff.base_text_string(cx).as_deref(), old_text)
+            });
+        }
     }
 
     #[test]
@@ -1182,7 +2065,7 @@ mod tests {
         cx.simulate_keystrokes("l j enter");
         assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
         assert_eq!(diff_views(&workspace, cx), vec![view.clone()]);
-        assert!(cx.update(|window, cx| { panel.focus_handle(cx).contains_focused(window, cx) }));
+        assert!(cx.update(|window, cx| panel.focus_handle(cx).contains_focused(window, cx)));
         cx.simulate_keystrokes("escape");
         list.read_with(cx, |list, _| {
             assert!(!list.has_filter());
@@ -1503,9 +2386,13 @@ mod tests {
             let confirmed_scroll = editor_scroll_y(&right_editor, cx);
             cx.simulate_keystrokes("g f");
             assert_eq!(editor_scroll_y(&right_editor, cx), confirmed_scroll);
-            assert!(
-                cx.update(|window, cx| { panel.focus_handle(cx).contains_focused(window, cx) })
-            );
+            assert!(cx.update(|window, cx| panel.focus_handle(cx).contains_focused(window, cx)));
+            cx.simulate_keystrokes("g f");
+            assert_eq!(editor_scroll_y(&right_editor, cx), confirmed_scroll);
+            assert!(diff_has_focus(&view, cx));
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.focus_panel::<GitPanel>(window, cx)
+            });
 
             cx.dispatch_action(menu::SelectPrevious);
             cx.run_until_parked();
@@ -1747,6 +2634,103 @@ mod tests {
         cx.dispatch_action(super::super::SelectCompareHalfPageUp);
         cx.run_until_parked();
         assert_eq!(selected_row(cx), Some(1));
+
+        bind_compare_keys(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<GitPanel>(window, cx);
+        });
+        let view = diff_views(&workspace, cx).into_iter().next().unwrap();
+        let original_path = shown_path(&view, cx);
+        let half_page = (rows_per_page / 2).max(1);
+        cx.simulate_keystrokes("ctrl-d");
+        cx.run_until_parked();
+        assert_eq!(selected_row(cx), Some(1 + half_page));
+        cx.simulate_keystrokes("ctrl-d");
+        cx.run_until_parked();
+        let after_paging = selected_row(cx).unwrap();
+        assert_eq!(after_paging, 1 + half_page * 2);
+        let paged_offset = scroll_y(cx);
+        assert!(paged_offset < px(0.));
+        let row_height = list.read_with(cx, |list, _| {
+            list.scroll_handle
+                .0
+                .borrow()
+                .last_item_size
+                .unwrap()
+                .contents
+                .height
+                / list.rows.len() as f32
+        });
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        assert_eq!(selected_row(cx), Some(after_paging + 1));
+        assert!((scroll_y(cx) - paged_offset).abs() <= row_height + px(1.));
+        cx.simulate_keystrokes("k");
+        cx.run_until_parked();
+        assert_eq!(selected_row(cx), Some(after_paging));
+        assert_eq!(scroll_y(cx), paged_offset);
+        cx.simulate_keystrokes("ctrl-u");
+        cx.run_until_parked();
+        assert_eq!(selected_row(cx), Some(after_paging - half_page));
+
+        let row_count = list.read_with(cx, |list, _| list.rows.len());
+        for _ in 0..row_count.div_ceil(half_page) {
+            cx.simulate_keystrokes("ctrl-d");
+            cx.run_until_parked();
+        }
+        assert_eq!(selected_row(cx), Some(row_count - 1));
+        let bottom_offset = scroll_y(cx);
+        cx.simulate_keystrokes("ctrl-d j");
+        cx.run_until_parked();
+        assert_eq!(selected_row(cx), Some(row_count - 1));
+        assert_eq!(scroll_y(cx), bottom_offset);
+        for _ in 0..row_count.div_ceil(half_page) {
+            cx.simulate_keystrokes("ctrl-u");
+            cx.run_until_parked();
+        }
+        assert_eq!(selected_row(cx), Some(0));
+        cx.simulate_keystrokes("ctrl-u k");
+        cx.run_until_parked();
+        assert_eq!(selected_row(cx), Some(0));
+        assert_eq!(scroll_y(cx), px(0.));
+
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("file_0");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (filtered_count, filtered_selection, filtered_half_page) =
+            list.read_with(cx, |list, _| {
+                assert_eq!(list.filter_query, "file_0");
+                (
+                    list.rows.len(),
+                    list.selected_row.unwrap(),
+                    (list.rows_per_page() / 2).max(1),
+                )
+            });
+        assert!(filtered_count > 1 && filtered_count < row_count);
+        cx.simulate_keystrokes("ctrl-d");
+        cx.run_until_parked();
+        let filtered_after_paging =
+            (filtered_selection + filtered_half_page).min(filtered_count - 1);
+        assert_eq!(selected_row(cx), Some(filtered_after_paging));
+        cx.simulate_keystrokes("ctrl-u");
+        cx.run_until_parked();
+        assert_eq!(
+            selected_row(cx),
+            Some(filtered_after_paging.saturating_sub(filtered_half_page))
+        );
+        assert_eq!(shown_path(&view, cx), original_path);
+        assert!(
+            cx.update(|window, cx| panel.read(cx).focus_handle(cx).contains_focused(window, cx))
+        );
+
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("missing-file");
+        cx.simulate_keystrokes("enter ctrl-d ctrl-u j k");
+        cx.run_until_parked();
+        assert!(list.read_with(cx, |list, _| list.rows.is_empty()));
+        assert_eq!(selected_row(cx), None);
+        assert_eq!(shown_path(&view, cx), original_path);
     }
 
     #[gpui::test]
@@ -1797,7 +2781,7 @@ mod tests {
 
         let dot_git = std::path::Path::new(util::path!("/project/.git"));
         let gate = fs.install_blob_read_gate_for_repo(dot_git);
-        cx.simulate_keystrokes("g f");
+        cx.simulate_keystrokes("g f g f");
         assert_eq!(gate.waiting(), 1);
         assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
         cx.simulate_keystrokes("j");
@@ -1810,7 +2794,10 @@ mod tests {
         gate.open();
         cx.run_until_parked();
         assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
-        assert!(panel_has_focus(cx), "confirming keeps focus in the panel");
+        assert!(
+            panel_has_focus(cx),
+            "later navigation cancels the pending focus transfer"
+        );
         cx.simulate_keystrokes("escape");
 
         let gate = fs.install_blob_read_gate_for_repo(dot_git);
@@ -1824,6 +2811,9 @@ mod tests {
             Some("src/changed.rs"),
             "confirming the displayed file cancels another pending load"
         );
+        assert!(panel_has_focus(cx));
+        cx.simulate_keystrokes("g f");
+        assert!(diff_has_focus(&view, cx));
 
         list.update_in(cx, |list, window, cx| {
             list.select_first(window, cx);
@@ -1835,6 +2825,9 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(shown_path(&view, cx).as_deref(), Some("src/deleted.rs"));
         assert_eq!(diff_views(&workspace, cx), vec![view.clone()]);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<GitPanel>(window, cx)
+        });
 
         let file_position = list.read_with(cx, |list, _| {
             let state = list.scroll_handle.0.borrow();
@@ -1854,6 +2847,16 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(shown_path(&view, cx).as_deref(), Some("src/added.rs"));
         assert!(panel_has_focus(cx), "clicking keeps focus in the panel");
+        cx.simulate_keystrokes("enter");
+        assert!(
+            panel_has_focus(cx),
+            "a mouse preview does not count as confirmation"
+        );
+        cx.simulate_click(file_position, Modifiers::default());
+        cx.simulate_keystrokes("enter");
+        assert!(panel_has_focus(cx), "clicking resets keyboard confirmation");
+        cx.simulate_keystrokes("g f");
+        assert!(diff_has_focus(&view, cx));
 
         workspace.update_in(cx, |workspace, window, cx| {
             let pane = workspace.active_pane().clone();
@@ -1873,5 +2876,197 @@ mod tests {
         assert_ne!(views[0], view);
         assert_eq!(shown_path(&views[0], cx).as_deref(), Some("src/changed.rs"));
         assert!(panel_has_focus(cx));
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(diff_has_focus(&views[0], cx));
+    }
+
+    #[gpui::test]
+    async fn test_keyboard_confirmation_focus_and_delayed_loads(cx: &mut TestAppContext) {
+        let (project, repository, fs) = setup("main", cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        bind_compare_keys(cx);
+        let panel = workspace.update_in(cx, GitPanel::new_test);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            start_comparison(
+                workspace,
+                repository,
+                branch("refs/heads/main"),
+                branch("refs/heads/feature"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let list = panel.read_with(cx, |panel, _| panel.compare_list().clone());
+        let view = diff_views(&workspace, cx).into_iter().next().unwrap();
+        let panel_has_focus = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| panel.focus_handle(cx).contains_focused(window, cx))
+        };
+        let select_row = |row, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.focus_panel::<GitPanel>(window, cx)
+            });
+            list.update_in(cx, |list, window, cx| {
+                list.select_row(|_, _| Some(row), window, cx)
+            });
+        };
+        assert!(
+            panel_has_focus(cx),
+            "the initial preview retains sidebar focus"
+        );
+        for (first_confirmation, second_confirmation) in [
+            ("enter", "enter"),
+            ("g f", "g f"),
+            ("enter", "g f"),
+            ("g f", "enter"),
+        ] {
+            select_row(1, cx);
+            cx.simulate_keystrokes(first_confirmation);
+            cx.run_until_parked();
+            assert!(
+                panel_has_focus(cx),
+                "the first keyboard confirmation keeps sidebar focus"
+            );
+            cx.simulate_keystrokes(second_confirmation);
+            cx.run_until_parked();
+            assert!(
+                diff_has_focus(&view, cx),
+                "the second keyboard confirmation focuses the editor"
+            );
+        }
+
+        select_row(1, cx);
+        cx.simulate_keystrokes("enter j k enter");
+        assert!(
+            panel_has_focus(cx),
+            "navigation resets keyboard confirmation"
+        );
+        cx.simulate_keystrokes("g f");
+        assert!(diff_has_focus(&view, cx));
+
+        select_row(1, cx);
+        cx.simulate_keystrokes("enter /");
+        cx.simulate_input("added");
+        cx.simulate_keystrokes("enter enter");
+        assert!(
+            panel_has_focus(cx),
+            "filtering resets keyboard confirmation"
+        );
+        cx.simulate_keystrokes("g f");
+        assert!(diff_has_focus(&view, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<GitPanel>(window, cx)
+        });
+        cx.simulate_keystrokes("escape");
+
+        let dot_git = std::path::Path::new(util::path!("/project/.git"));
+        select_row(2, cx);
+        let gate = fs.install_blob_read_gate_for_repo(dot_git);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(gate.waiting(), 1);
+        gate.open();
+        cx.run_until_parked();
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
+        assert!(
+            panel_has_focus(cx),
+            "the first confirmation only previews a loaded file"
+        );
+        cx.simulate_keystrokes("enter");
+        assert!(diff_has_focus(&view, cx));
+
+        select_row(1, cx);
+        cx.simulate_keystrokes("enter");
+        assert!(panel_has_focus(cx));
+        select_row(2, cx);
+        let gate = fs.install_blob_read_gate_for_repo(dot_git);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(gate.waiting(), 1);
+        assert!(panel_has_focus(cx));
+        cx.simulate_keystrokes("g f");
+        assert_eq!(
+            gate.waiting(),
+            1,
+            "confirming the pending file reuses its load"
+        );
+        gate.open();
+        cx.run_until_parked();
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
+        assert!(
+            diff_has_focus(&view, cx),
+            "a confirmed load focuses the editor on completion"
+        );
+
+        select_row(3, cx);
+        let gate = fs.install_blob_read_gate_for_repo(dot_git);
+        cx.simulate_keystrokes("g f g f");
+        assert_eq!(gate.waiting(), 1);
+        let other_editor = cx.new_window_entity(Editor::single_line);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(other_editor.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+        });
+        gate.open();
+        cx.run_until_parked();
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/deleted.rs"));
+        assert!(cx.update(|window, cx| other_editor.focus_handle(cx).is_focused(window)));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_item(cx)
+                .unwrap()
+                .item_id()),
+            other_editor.entity_id(),
+            "a delayed load does not reactivate the diff after switching tabs"
+        );
+
+        select_row(2, cx);
+        let gate = fs.install_blob_read_gate_for_repo(dot_git);
+        cx.simulate_keystrokes("enter enter");
+        assert_eq!(gate.waiting(), 1);
+        workspace.update_in(cx, |_, window, cx| {
+            other_editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        gate.open();
+        cx.run_until_parked();
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/changed.rs"));
+        assert!(
+            panel_has_focus(cx),
+            "leaving and returning to the sidebar cancels the focus request"
+        );
+
+        select_row(3, cx);
+        let gate = fs.install_blob_read_gate_for_repo(dot_git);
+        cx.simulate_keystrokes("g f g f");
+        assert_eq!(gate.waiting(), 1);
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("changed");
+        gate.open();
+        cx.run_until_parked();
+        assert_eq!(shown_path(&view, cx).as_deref(), Some("src/deleted.rs"));
+        assert!(cx.update(|window, cx| list.read(cx).filter_is_focused(window, cx)));
+        cx.simulate_keystrokes("enter escape");
+        select_row(0, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            panel_has_focus(cx),
+            "directory confirmation retains sidebar focus"
+        );
     }
 }

@@ -6,8 +6,9 @@ use std::{
 use anyhow::Result;
 use collections::HashSet;
 use editor::{
-    Direction, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, SplittableEditor,
-    scroll::ScrollAmount,
+    Direction, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, SelectionEffects,
+    SplittableEditor,
+    scroll::{Autoscroll, ScrollAmount},
 };
 use git::repository::RepoPath;
 use gpui::{
@@ -159,6 +160,31 @@ impl CompareDiffView {
         self.comparison_title = comparison_title;
         cx.emit(EditorEvent::TitleChanged);
         cx.notify();
+    }
+
+    pub(crate) fn reveal_row(&mut self, row: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.shown_file.as_ref() else {
+            return;
+        };
+        let buffer = file.buffer.clone();
+        let editor = self.editor.read(cx).rhs_editor().clone();
+        editor.update(cx, |editor, cx| {
+            let buffer = buffer.read(cx);
+            let point = Point::new(row.min(buffer.max_point().row), 0);
+            let buffer_anchor = buffer.anchor_before(point);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let Some(anchor) = snapshot.anchor_in_buffer(buffer_anchor) else {
+                return;
+            };
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| {
+                    selections.select_ranges([anchor..anchor]);
+                },
+            );
+        });
     }
 
     fn clear_shown_file(&mut self, cx: &mut Context<Self>) {
