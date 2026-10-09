@@ -1,9 +1,10 @@
 use super::*;
-use editor::Editor;
+use editor::{Editor, MultiBufferOffset, SelectionEffects};
 use gpui::{TestAppContext, VisualTestContext};
 use menu::SelectPrevious;
 use project::{Project, ProjectPath};
 use serde_json::json;
+use std::{cell::RefCell, rc::Rc};
 use util::{path, rel_path::rel_path};
 use workspace::{ActivatePreviousItem, AppState, MultiWorkspace, Workspace, item::test::TestItem};
 
@@ -335,6 +336,7 @@ fn get_active_tab_switcher(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
 ) -> Entity<Picker<TabSwitcherDelegate>> {
+    cx.run_until_parked();
     workspace.update(cx, |workspace, cx| {
         workspace
             .active_modal::<TabSwitcher>(cx)
@@ -343,6 +345,309 @@ fn get_active_tab_switcher(
             .picker
             .clone()
     })
+}
+
+fn open_tab_switcher_with_preview(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (Entity<Picker<TabSwitcherDelegate>>, Entity<Editor>) {
+    let editors = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = cx.update({
+        let editors = editors.clone();
+        move |_, cx| {
+            cx.observe_new::<Editor>(move |_, _, cx| {
+                editors.borrow_mut().push(cx.entity());
+            })
+        }
+    });
+    let picker = open_tab_switcher_for_active_pane(workspace, cx);
+    let preview = cx
+        .read(|cx| {
+            editors
+                .borrow()
+                .iter()
+                .find(|editor| editor.read(cx).read_only(cx))
+                .cloned()
+        })
+        .expect("the tab switcher should create a read-only preview editor");
+    (picker, preview)
+}
+
+#[gpui::test]
+async fn test_open_in_active_pane_previews_live_buffers_without_switching_tabs(
+    cx: &mut TestAppContext,
+) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "first.txt": "Saved contents",
+                "second.txt": "Second file",
+            }),
+        )
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+    let first = open_buffer("first.txt", &workspace, cx).await;
+    let first_editor = cx.read(|cx| first.act_as::<Editor>(cx).unwrap());
+    let contents = (0..500)
+        .map(|row| {
+            if row == 350 {
+                "Unsaved cursor line\n".to_string()
+            } else {
+                format!("Line {row}\n")
+            }
+        })
+        .collect::<String>();
+    let cursor = MultiBufferOffset(contents.find("Unsaved cursor line").unwrap());
+    first_editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(contents, window, cx);
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([cursor..cursor]);
+        });
+    });
+    let second = open_buffer("second.txt", &workspace, cx).await;
+    let (picker, preview) = open_tab_switcher_with_preview(&workspace, cx);
+    assert!(
+        preview
+            .read_with(cx, |editor, cx| editor.text(cx))
+            .contains("Unsaved cursor line")
+    );
+    preview.update_in(cx, |editor, window, cx| {
+        assert!(
+            editor.snapshot(window, cx).scroll_position().y > 0.0,
+            "the cursor should be centered in the preview"
+        );
+    });
+    let original_selection =
+        first_editor.read_with(cx, |editor, _| *editor.selections.newest_anchor());
+    let assert_workspace_unchanged = |cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item(cx).unwrap().item_id(),
+                second.item_id()
+            );
+            assert_eq!(workspace.active_pane().read(cx).items_len(), 2);
+        });
+        first_editor.read_with(cx, |editor, _| {
+            assert_eq!(*editor.selections.newest_anchor(), original_selection)
+        });
+    };
+    assert_workspace_unchanged(cx);
+    cx.dispatch_action(menu::SelectNext);
+    cx.run_until_parked();
+    assert_eq!(
+        preview.read_with(cx, |editor, cx| editor.text(cx)),
+        "Second file"
+    );
+    assert_workspace_unchanged(cx);
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("first", window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        preview
+            .read_with(cx, |editor, cx| editor.text(cx))
+            .contains("Unsaved cursor line")
+    );
+    assert_workspace_unchanged(cx);
+    cx.dispatch_action(menu::Cancel);
+    cx.run_until_parked();
+    assert_workspace_unchanged(cx);
+    assert_tab_switcher_is_closed(workspace.clone(), cx);
+}
+
+#[gpui::test]
+async fn test_open_in_active_pane_preview_refreshes_after_closing_and_filtering(
+    cx: &mut TestAppContext,
+) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "first.txt": "First file",
+                "second.txt": "Second file",
+                "third.txt": "Third file",
+            }),
+        )
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+    open_buffer("first.txt", &workspace, cx).await;
+    open_buffer("second.txt", &workspace, cx).await;
+    open_buffer("third.txt", &workspace, cx).await;
+    let (picker, preview) = open_tab_switcher_with_preview(&workspace, cx);
+    assert_eq!(
+        preview.read_with(cx, |editor, cx| editor.text(cx)),
+        "Second file"
+    );
+    cx.dispatch_action(CloseSelectedItem);
+    cx.run_until_parked();
+    assert_eq!(
+        preview.read_with(cx, |editor, cx| editor.text(cx)),
+        "First file"
+    );
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("missing", window, cx)
+    });
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, cx| {
+        assert_eq!(picker.delegate.match_count(), 0);
+        assert!(picker.delegate.try_get_preview_data_for_match(cx).is_none());
+    });
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("third", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        preview.read_with(cx, |editor, cx| editor.text(cx)),
+        "Third file"
+    );
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+    assert_tab_switcher_is_closed(workspace.clone(), cx);
+    assert_eq!(
+        workspace.read_with(cx, |workspace, cx| workspace
+            .active_item_as::<Editor>(cx)
+            .unwrap()
+            .read(cx)
+            .title(cx)
+            .into_owned()),
+        "third.txt"
+    );
+}
+
+#[gpui::test]
+async fn test_open_in_active_pane_previews_untitled_buffers_and_cursor_boundaries(
+    cx: &mut TestAppContext,
+) {
+    let app_state = init_test(cx);
+    let project = Project::test(app_state.fs.clone(), [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+    let editor = workspace
+        .update_in(cx, Editor::new_in_workspace)
+        .await
+        .unwrap();
+    let (picker, preview) = open_tab_switcher_with_preview(&workspace, cx);
+    assert_eq!(preview.read_with(cx, |editor, cx| editor.text(cx)), "");
+    for contents in ["Untitled contents", "First line\n\n", ""] {
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(contents, window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                let cursor = MultiBufferOffset(contents.len());
+                selections.select_ranges([cursor..cursor]);
+            });
+        });
+        picker.update_in(cx, |picker, window, cx| picker.refresh(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            preview.read_with(cx, |editor, cx| editor.text(cx)),
+            contents
+        );
+        picker.read_with(cx, |picker, cx| {
+            let update = picker.delegate.try_get_preview_data_for_match(cx).unwrap();
+            assert!(matches!(update.source, picker::PreviewSource::Buffer(_)));
+            assert_eq!(
+                update.match_location.unwrap().range,
+                contents.len()..contents.len()
+            );
+        });
+    }
+    let item = cx.new(|cx| {
+        let mut item = TestItem::new(cx).with_label("terminal");
+        item.tab_descriptions = Some(vec!["terminal"]);
+        item
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item), None, false, window, cx)
+    });
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("terminal", window, cx)
+    });
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, cx| {
+        let update = picker.delegate.try_get_preview_data_for_match(cx).unwrap();
+        let picker::PreviewSource::Message(message) = update.source else {
+            panic!("non-editor tabs should show a placeholder")
+        };
+        assert_eq!(message.text.as_ref(), "No preview available for this tab");
+    });
+}
+
+#[gpui::test]
+async fn test_open_in_active_pane_previews_multibuffer_at_cursor(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "first.txt": "First file",
+                "second.txt": "Second file",
+            }),
+        )
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+    let first = open_buffer("first.txt", &workspace, cx).await;
+    let second = open_buffer("second.txt", &workspace, cx).await;
+    let buffers = cx.read(|cx| {
+        [&first, &second].map(|item| {
+            item.act_as::<Editor>(cx)
+                .unwrap()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+        })
+    });
+    let multi_buffer = cx.new(|cx| {
+        let capability = buffers[0].read(cx).capability();
+        let mut multi_buffer =
+            editor::MultiBuffer::without_headers(capability).with_title("combined".to_string());
+        for buffer in &buffers {
+            let end = buffer.read(cx).max_point();
+            multi_buffer.set_excerpts_for_buffer(buffer.clone(), [Default::default()..end], 0, cx);
+        }
+        multi_buffer
+    });
+    let editor = cx.new_window_entity(|window, cx| {
+        let mut editor = Editor::for_multibuffer(multi_buffer, Some(project), window, cx);
+        let cursor = editor.buffer().read(cx).snapshot(cx).len();
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([cursor..cursor])
+        });
+        editor
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+    });
+    let (picker, preview) = open_tab_switcher_with_preview(&workspace, cx);
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("combined", window, cx)
+    });
+    cx.run_until_parked();
+    preview.read_with(cx, |editor, cx| {
+        assert_eq!(editor.text(cx), "Second file");
+        assert_eq!(editor.buffer().read(cx).all_buffers().len(), 1);
+        assert!(editor.buffer().read(cx).all_buffers().contains(&buffers[1]));
+    });
 }
 
 async fn open_buffer(

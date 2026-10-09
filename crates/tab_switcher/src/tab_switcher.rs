@@ -2,8 +2,9 @@
 mod tab_switcher_tests;
 
 use collections::{HashMap, HashSet};
-use editor::items::{
-    entry_diagnostic_aware_icon_decoration_and_color, entry_git_aware_label_color,
+use editor::{
+    Editor,
+    items::{entry_diagnostic_aware_icon_decoration_and_color, entry_git_aware_label_color},
 };
 use fuzzy_nucleo::StringMatchCandidate;
 use gpui::{
@@ -186,7 +187,11 @@ impl TabSwitcher {
         });
         Self {
             picker: cx.new(|cx| {
-                if is_global {
+                if delegate.open_in_active_pane {
+                    let preview =
+                        picker_preview::editor_preview(delegate.project.clone(), window, cx);
+                    Picker::list_with_preview(delegate, preview, window, cx)
+                } else if is_global {
                     Picker::list(delegate, window, cx)
                 } else {
                     Picker::nonsearchable_list(delegate, window, cx)
@@ -249,7 +254,9 @@ impl Render for TabSwitcher {
         let picker = self.picker.clone();
         v_flex()
             .key_context("TabSwitcher")
-            .w(rems(PANEL_WIDTH_REMS))
+            .when(!picker.read(cx).delegate.open_in_active_pane, |this| {
+                this.w(rems(PANEL_WIDTH_REMS))
+            })
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_action(cx.listener(Self::handle_close_selected_item))
             .when(self.visible, |el| el.child(picker.clone()))
@@ -280,6 +287,7 @@ pub struct TabSwitcherDelegate {
     is_all_panes: bool,
     open_in_active_pane: bool,
     restored_items: bool,
+    sync_selection_after_update: bool,
 }
 
 impl TabMatch {
@@ -382,6 +390,7 @@ impl TabSwitcherDelegate {
             open_in_active_pane,
             original_items,
             restored_items: false,
+            sync_selection_after_update: false,
         }
     }
 
@@ -397,23 +406,14 @@ impl TabSwitcherDelegate {
             match event {
                 WorkspaceEvent::ItemAdded { .. } | WorkspaceEvent::PaneRemoved => {
                     tab_switcher.picker.update(cx, |picker, cx| {
-                        let query = picker.query(cx);
-                        picker.delegate.update_matches(query, window, cx);
-                        cx.notify();
+                        picker.refresh(window, cx);
                     })
                 }
                 WorkspaceEvent::ItemRemoved { .. } => {
                     tab_switcher.picker.update(cx, |picker, cx| {
-                        let query = picker.query(cx);
-                        picker.delegate.update_matches(query, window, cx);
-
-                        // When the Tab Switcher is being used and an item is
-                        // removed, there's a chance that the new selected index
-                        // will not match the actual tab that is now being displayed
-                        // by the pane, as such, the selected index needs to be
-                        // updated to match the pane's state.
-                        picker.delegate.sync_selected_index(cx);
-                        cx.notify();
+                        picker.delegate.sync_selection_after_update =
+                            !picker.delegate.open_in_active_pane;
+                        picker.refresh(window, cx);
                     })
                 }
                 _ => {}
@@ -501,23 +501,12 @@ impl TabSwitcherDelegate {
         }
     }
 
-    fn update_matches(
+    fn update_pane_matches(
         &mut self,
         query: String,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        if self.is_all_panes {
-            // needed because we need to borrow the workspace, but that may be borrowed when the picker
-            // calls update_matches.
-            let this = cx.entity();
-            window.defer(cx, move |window, cx| {
-                this.update(cx, |this, cx| {
-                    this.delegate.update_all_pane_matches(query, window, cx);
-                })
-            });
-            return;
-        }
         let selected_item_id = self.selected_item_id();
         self.matches.clear();
         let Some(pane) = self.pane.upgrade() else {
@@ -799,8 +788,58 @@ impl PickerDelegate for TabSwitcherDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
-        self.update_matches(raw_query, window, cx);
+        if self.is_all_panes {
+            // The workspace can still be borrowed while the picker is being opened.
+            return cx.spawn_in(window, async move |picker, cx| {
+                picker
+                    .update_in(cx, |picker, window, cx| {
+                        picker
+                            .delegate
+                            .update_all_pane_matches(raw_query, window, cx);
+                        if std::mem::take(&mut picker.delegate.sync_selection_after_update) {
+                            picker.delegate.sync_selected_index(cx);
+                        }
+                    })
+                    .log_err();
+            });
+        }
+        self.update_pane_matches(raw_query, window, cx);
+        if std::mem::take(&mut self.sync_selection_after_update) {
+            self.sync_selected_index(cx);
+        }
         Task::ready(())
+    }
+
+    fn default_preview_layout(&self) -> picker::PreviewLayout {
+        if self.open_in_active_pane {
+            picker::PreviewLayout::Right
+        } else {
+            picker::PreviewLayout::Hidden
+        }
+    }
+
+    fn try_get_preview_data_for_match(&self, cx: &App) -> Option<picker::PreviewUpdate> {
+        let selected_match = self.matches.get(self.selected_index)?;
+        if let Some(editor) = selected_match.item.act_as::<Editor>(cx) {
+            let editor = editor.read(cx);
+            let cursor = editor.selections.newest_anchor().head();
+            if let Some((buffer, cursor)) = editor
+                .buffer()
+                .read(cx)
+                .text_anchor_for_position(cursor, cx)
+            {
+                let snapshot = buffer.read(cx).text_snapshot();
+                let offset = snapshot.offset_for_anchor(&cursor);
+                let location = picker::MatchLocation {
+                    anchor_range: snapshot.anchor_before(offset)..snapshot.anchor_after(offset),
+                    range: offset..offset,
+                };
+                return Some(picker::PreviewUpdate::from_buffer(buffer, location));
+            }
+        }
+        let mut message = picker::HighlightedTextBuilder::default();
+        message.push_plain("No preview available for this tab");
+        Some(picker::PreviewUpdate::message(message.build()))
     }
 
     fn confirm(

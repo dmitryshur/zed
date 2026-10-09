@@ -40,6 +40,10 @@ actions!(
         ScrollCompareListDown,
         /// Scrolls the Compare tab's list up by half a page without changing the selection.
         ScrollCompareListUp,
+        /// Scrolls the displayed comparison diff down by half a page without moving focus.
+        ScrollCompareDiffDown,
+        /// Scrolls the displayed comparison diff up by half a page without moving focus.
+        ScrollCompareDiffUp,
         /// Moves the Compare tab's selection down by half a page.
         SelectCompareHalfPageDown,
         /// Moves the Compare tab's selection up by half a page.
@@ -70,6 +74,16 @@ pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ScrollCompareListUp, _, cx| {
         update_compare_list(workspace, cx, |list, cx| {
             list.scroll_half_page(VerticalDirection::Up, cx)
+        });
+    });
+    workspace.register_action(|workspace, _: &ScrollCompareDiffDown, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| {
+            list.scroll_diff(VerticalDirection::Down, workspace, window, cx)
+        });
+    });
+    workspace.register_action(|workspace, _: &ScrollCompareDiffUp, window, cx| {
+        update_compare_list(workspace, cx, |list, cx| {
+            list.scroll_diff(VerticalDirection::Up, workspace, window, cx)
         });
     });
     workspace.register_action(|workspace, _: &SelectCompareHalfPageDown, window, cx| {

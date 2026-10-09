@@ -380,6 +380,11 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
 
+    /// Used when this picker has no saved preview layout.
+    fn default_preview_layout(&self) -> PreviewLayout {
+        PreviewLayout::Hidden
+    }
+
     /// Called on the delegate when opening a preview to the side. Delegates can
     /// then change how much space they use for rendering the match
     fn preview_layout_changed(&mut self, _layout_is_horizontal: bool) {}
@@ -606,7 +611,7 @@ impl<D: PickerDelegate> Picker<D> {
             preview.layout = persistence::load_last_preview_layout(D::name(), cx)
                 .log_err()
                 .flatten()
-                .unwrap_or_default();
+                .unwrap_or_else(|| delegate.default_preview_layout());
         };
         let has_preview = preview.is_some();
         let persisted_shape =
@@ -1730,7 +1735,10 @@ impl<D: PickerDelegate> Picker<D> {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use std::cell::Cell;
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     struct TestDelegate {
         items: Vec<bool>,
@@ -1742,6 +1750,7 @@ mod tests {
         persistent_multi_select: bool,
         selected_items: Vec<usize>,
         multi_confirmed: Rc<Cell<Option<Vec<usize>>>>,
+        default_preview_layout: PreviewLayout,
     }
 
     impl TestDelegate {
@@ -1756,6 +1765,7 @@ mod tests {
                 persistent_multi_select: false,
                 selected_items: Vec::new(),
                 multi_confirmed: Rc::new(Cell::new(None)),
+                default_preview_layout: PreviewLayout::Hidden,
             }
         }
 
@@ -1780,6 +1790,10 @@ mod tests {
 
         fn match_count(&self) -> usize {
             self.items.len()
+        }
+
+        fn default_preview_layout(&self) -> PreviewLayout {
+            self.default_preview_layout
         }
 
         fn selected_index(&self) -> usize {
@@ -1906,6 +1920,94 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    struct TestPreview {
+        cleared: Arc<AtomicBool>,
+    }
+
+    impl PreviewBackend for TestPreview {
+        fn update(&self, _: PreviewUpdate, _: &mut Window, _: &mut App) {}
+
+        fn render(&self, _: PreviewLayout, _: &mut App) -> AnyElement {
+            gpui::Empty.into_any_element()
+        }
+
+        fn adjust_to_new_size(&self, _: &mut Window, _: &mut App) {}
+
+        fn clear(&self, _: &mut App) {
+            self.cleared.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_default_preview_layout_and_persistence(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.read(|cx| db::kvp::KeyValueStore::global(cx));
+        let layout_key = "test/LAST_PREVIEW_LAYOUT".to_string();
+        store
+            .scoped("pickers_v2")
+            .delete(layout_key.clone())
+            .await
+            .unwrap();
+        let cleared = Arc::new(AtomicBool::new(false));
+        let preview: Arc<dyn PreviewBackend> = Arc::new(TestPreview {
+            cleared: cleared.clone(),
+        });
+        let (picker, cx) = cx.add_window_view({
+            let preview = preview.clone();
+            move |window, cx| {
+                Picker::list_with_preview(TestDelegate::new(vec![true]), preview, window, cx)
+            }
+        });
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.preview_layout()),
+            Some(PreviewLayout::Hidden)
+        );
+
+        let make_picker = |window: &mut Window, cx: &mut Context<Picker<TestDelegate>>| {
+            let mut delegate = TestDelegate::new(vec![true]);
+            delegate.default_preview_layout = PreviewLayout::Right;
+            Picker::list_with_preview(delegate, preview.clone(), window, cx)
+        };
+        let picker = cx.new_window_entity(make_picker);
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.preview_layout()),
+            Some(PreviewLayout::Right)
+        );
+        let original_size = cx.update(|window, _| window.viewport_size());
+        cx.simulate_resize(gpui::size(px(300.), px(600.)));
+        cx.run_until_parked();
+        picker.update_in(cx, |picker, window, _| {
+            assert_eq!(picker.preview_layout(), Some(PreviewLayout::Right));
+            assert_eq!(
+                picker.preview_layout_rendered(window),
+                Some(PreviewLayout::Below)
+            );
+        });
+        cx.simulate_resize(original_size);
+        cx.run_until_parked();
+        for layout in [PreviewLayout::Below, PreviewLayout::Hidden] {
+            picker.update_in(cx, |picker, window, cx| {
+                picker.set_preview_layout(layout, window, cx)
+            });
+            cx.run_until_parked();
+            let reopened = cx.new_window_entity(make_picker);
+            assert_eq!(
+                reopened.read_with(cx, |picker, _| picker.preview_layout()),
+                Some(layout)
+            );
+        }
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.items.clear();
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cleared.load(Ordering::Relaxed),
+            "empty results must clear the previous preview"
+        );
+        store.scoped("pickers_v2").delete(layout_key).await.unwrap();
     }
 
     #[gpui::test]

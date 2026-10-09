@@ -7,6 +7,7 @@ use anyhow::Result;
 use collections::HashSet;
 use editor::{
     Direction, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, SplittableEditor,
+    scroll::ScrollAmount,
 };
 use git::repository::RepoPath;
 use gpui::{
@@ -85,6 +86,24 @@ impl CompareDiffView {
 
     pub(crate) fn shown_path(&self) -> Option<&RepoPath> {
         self.shown_file.as_ref().map(|file| &file.repo_path)
+    }
+
+    #[cfg(test)]
+    pub(super) fn editor(&self) -> &Entity<SplittableEditor> {
+        &self.editor
+    }
+
+    pub(crate) fn scroll(
+        &mut self,
+        amount: &ScrollAmount,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shown_file.is_none() {
+            return;
+        }
+        let editor = self.editor.read(cx).rhs_editor().clone();
+        editor.update(cx, |editor, cx| editor.scroll_screen(amount, window, cx));
     }
 
     pub(crate) fn show_file(

@@ -1145,8 +1145,8 @@
       "l": "git_panel::ExpandCompareEntry",
       "ctrl-d": "git_panel::ScrollCompareListDown",
       "ctrl-u": "git_panel::ScrollCompareListUp",
-      "ctrl-f": "git_panel::SelectCompareHalfPageDown",
-      "ctrl-b": "git_panel::SelectCompareHalfPageUp",
+      "ctrl-f": "git_panel::ScrollCompareDiffDown",
+      "ctrl-b": "git_panel::ScrollCompareDiffUp",
     },
   },
   {

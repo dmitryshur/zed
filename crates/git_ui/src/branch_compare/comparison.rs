@@ -228,6 +228,10 @@ impl BranchComparison {
         &self.state
     }
 
+    pub(crate) fn mode(&self) -> ComparisonMode {
+        self.mode
+    }
+
     pub(crate) fn compared_commit(&self) -> Option<Oid> {
         self.loaded_for
             .map(|(_, [_, compared_commit])| compared_commit)
