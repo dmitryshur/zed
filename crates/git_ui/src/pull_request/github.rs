@@ -78,14 +78,25 @@ impl CommandOutput {
         if self.success {
             return Ok(self.stdout);
         }
-        let details = self
+        let lines = self
             .stderr
             .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("no output")
-            .trim()
-            .to_string();
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        // `gh` ends with a generic "failed to run git" line; git's own error lines say why.
+        let git_errors = lines
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix("fatal: ")
+                    .or_else(|| line.strip_prefix("error: "))
+            })
+            .collect::<Vec<_>>();
+        let details = if git_errors.is_empty() {
+            lines.last().copied().unwrap_or("no output").to_string()
+        } else {
+            git_errors.join("; ")
+        };
         Err(anyhow!("{description} failed: {details}"))
     }
 }

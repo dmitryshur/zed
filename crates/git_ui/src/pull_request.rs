@@ -13,7 +13,11 @@ mod threads;
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use util::paths::PathExt as _;
+
+use std::path::Path;
+
+use anyhow::{Result, anyhow, bail};
 use futures::FutureExt as _;
 use gpui::{
     App, AppContext as _, AsyncWindowContext, Context, Entity, SharedString, Window, actions,
@@ -206,7 +210,7 @@ fn start_review(
             client,
             &github_repository,
             &repository,
-            number,
+            &pull_request,
             git_objects,
             cx,
         )
@@ -250,11 +254,31 @@ async fn check_out(
     client: ClientTask,
     github_repository: &GitHubRepository,
     repository: &Entity<Repository>,
-    number: u64,
+    pull_request: &PullRequestSummary,
     git_objects: gpui::Task<Result<LocalGitObjects>>,
     cx: &mut AsyncWindowContext,
 ) -> Result<CheckedOutPullRequest> {
+    let number = pull_request.number;
     let client = client.await.map_err(|error| anyhow!(error))?;
+    // Git checks a branch out in only one worktree, and its refusal is cryptic once `gh`
+    // wraps it.
+    let work_directory = repository.read_with(cx, |repository, _| {
+        repository.work_directory_abs_path.clone()
+    });
+    let worktrees = client
+        .commands()
+        .run("git", &["worktree", "list", "--porcelain"])
+        .await?
+        .into_stdout("Listing git worktrees")?;
+    if let Some(other_worktree) =
+        worktree_with_branch(&worktrees, &pull_request.head_ref_name, &work_directory)
+    {
+        bail!(
+            "#{number}'s branch {} is checked out in {}. Open that folder to review it",
+            pull_request.head_ref_name,
+            other_worktree.compact().display()
+        );
+    }
     let checkout = cx.update(|_, cx| {
         client.commands().run_as_job(
             repository,
@@ -327,6 +351,24 @@ async fn check_out(
         files,
         branch,
         git_objects,
+    })
+}
+
+/// The worktree other than `current` that has `branch` checked out, from the output of
+/// `git worktree list --porcelain`.
+fn worktree_with_branch<'a>(porcelain: &'a str, branch: &str, current: &Path) -> Option<&'a Path> {
+    let branch_ref = format!("refs/heads/{branch}");
+    porcelain.split("\n\n").find_map(|entry| {
+        let mut path = None;
+        let mut has_branch = false;
+        for line in entry.lines() {
+            if let Some(worktree_path) = line.strip_prefix("worktree ") {
+                path = Some(Path::new(worktree_path));
+            } else if line.strip_prefix("branch ") == Some(branch_ref.as_str()) {
+                has_branch = true;
+            }
+        }
+        path.filter(|path| has_branch && *path != current)
     })
 }
 

@@ -36,6 +36,8 @@ type Requests = Arc<Mutex<Vec<(String, Value)>>>;
 struct FakeRunner {
     calls: Mutex<Vec<String>>,
     fs: Arc<FakeFs>,
+    /// What `git worktree list --porcelain` prints.
+    worktrees: Mutex<String>,
 }
 
 impl CommandRunner for FakeRunner {
@@ -49,20 +51,21 @@ impl CommandRunner for FakeRunner {
         let line = format!("{program} {}", args.join(" "));
         self.calls.lock().push(line.clone());
         let (success, stdout) = match line.as_str() {
-            "gh auth token --hostname github.com" => (true, "test-token\n"),
+            "gh auth token --hostname github.com" => (true, "test-token\n".to_string()),
             "gh pr checkout 7 -R owner/repo" => {
                 self.fs
                     .set_branch_name(Path::new(path!("/project/.git")), Some("feature"));
-                (true, "")
+                (true, String::new())
             }
-            "git symbolic-ref -q HEAD" => (true, "refs/heads/feature\n"),
-            _ if line.starts_with("git cat-file -e ") => (true, ""),
-            _ => (false, ""),
+            "git symbolic-ref -q HEAD" => (true, "refs/heads/feature\n".to_string()),
+            "git worktree list --porcelain" => (true, self.worktrees.lock().clone()),
+            _ if line.starts_with("git cat-file -e ") => (true, String::new()),
+            _ => (false, String::new()),
         };
         Box::pin(async move {
             Ok(CommandOutput {
                 success,
-                stdout: stdout.to_string(),
+                stdout,
                 stderr: if success {
                     String::new()
                 } else {
@@ -355,6 +358,10 @@ async fn setup(
     let runner = Arc::new(FakeRunner {
         calls: Mutex::default(),
         fs: fs.clone(),
+        worktrees: Mutex::new(format!(
+            "worktree {}\nHEAD {HEAD_SHA}\nbranch refs/heads/main\n",
+            path!("/project")
+        )),
     });
     let requests = Requests::default();
     let threads = Arc::new(Mutex::new(vec![
@@ -993,5 +1000,81 @@ async fn test_edit_and_delete_own_published_comment(cx: &mut TestAppContext) {
             .read_with(cx, |binding, cx| binding.editable_comment_ids("T1", cx))
             .is_empty(),
         "the thread keeps only the other comments"
+    );
+}
+
+#[gpui::test]
+async fn test_review_refuses_branch_checked_out_in_another_worktree(cx: &mut TestAppContext) {
+    let (test, cx) = setup(DiffViewStyle::Unified, cx).await;
+    *test.runner.worktrees.lock() = format!(
+        "worktree {}\nHEAD {HEAD_SHA}\nbranch refs/heads/main\n\nworktree {}\nHEAD {HEAD_SHA}\nbranch refs/heads/feature\n",
+        path!("/project"),
+        path!("/other-worktree"),
+    );
+    start_review(&test, cx);
+    assert!(
+        !test
+            .runner
+            .calls
+            .lock()
+            .iter()
+            .any(|call| call.starts_with("gh pr checkout")),
+        "git would refuse to check the branch out a second time"
+    );
+    assert!(
+        test.workspace
+            .read_with(cx, |workspace, cx| workspace
+                .items_of_type::<CompareDiffView>(cx)
+                .next())
+            .is_none()
+    );
+}
+
+#[test]
+fn test_worktree_with_branch() {
+    let porcelain = "worktree /work/samw\nHEAD 1111\nbranch refs/heads/feature/sp-12820\n\nworktree /work/samw-worktree\nHEAD 2222\ndetached\n\nworktree /work/samw-worktree-2\nHEAD 3333\nbranch refs/heads/feature/sp-12819\n";
+    assert_eq!(
+        super::worktree_with_branch(porcelain, "feature/sp-12819", Path::new("/work/samw")),
+        Some(Path::new("/work/samw-worktree-2"))
+    );
+    assert_eq!(
+        super::worktree_with_branch(
+            porcelain,
+            "feature/sp-12819",
+            Path::new("/work/samw-worktree-2")
+        ),
+        None,
+        "the current worktree having the branch is fine"
+    );
+    assert_eq!(
+        super::worktree_with_branch(porcelain, "feature/sp-1281", Path::new("/work/samw")),
+        None,
+        "branch names must match exactly"
+    );
+}
+
+#[test]
+fn test_command_errors_show_git_reason() {
+    let output = CommandOutput {
+        success: false,
+        stdout: String::new(),
+        stderr: "fatal: 'feature/sp-12819' is already used by worktree at '/work/samw-worktree-2'\nfailed to run git: exit status 128\n".to_string(),
+    };
+    assert_eq!(
+        output
+            .into_stdout("`gh pr checkout 28511`")
+            .map_err(|error| error.to_string()),
+        Err("`gh pr checkout 28511` failed: 'feature/sp-12819' is already used by worktree at '/work/samw-worktree-2'".to_string())
+    );
+    let output = CommandOutput {
+        success: false,
+        stdout: String::new(),
+        stderr: "could not resolve host\n".to_string(),
+    };
+    assert_eq!(
+        output
+            .into_stdout("`gh pr checkout 1`")
+            .map_err(|error| error.to_string()),
+        Err("`gh pr checkout 1` failed: could not resolve host".to_string())
     );
 }
