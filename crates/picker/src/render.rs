@@ -258,17 +258,20 @@ impl<D: PickerDelegate> Picker<D> {
                 )
             })
             .when(self.delegate.match_count() == 0, |el| {
-                el.when_some(self.delegate.no_matches_text(window, cx), |el, text| {
-                    el.child(
-                        v_flex().flex_grow_1().py_2().child(
-                            ListItem::new("empty_state")
-                                .inset(true)
-                                .spacing(ListItemSpacing::Sparse)
-                                .disabled(true)
-                                .child(Label::new(text).color(Color::Muted)),
-                        ),
-                    )
-                })
+                // Headers can hold controls (e.g. filters) that must stay usable while there
+                // are no results to show.
+                el.children(self.delegate.render_header(window, cx))
+                    .when_some(self.delegate.no_matches_text(window, cx), |el, text| {
+                        el.child(
+                            v_flex().flex_grow_1().py_2().child(
+                                ListItem::new("empty_state")
+                                    .inset(true)
+                                    .spacing(ListItemSpacing::Sparse)
+                                    .disabled(true)
+                                    .child(Label::new(text).color(Color::Muted)),
+                            ),
+                        )
+                    })
             })
             .children(self.render_footer(window, cx))
             .children(match &self.head {
