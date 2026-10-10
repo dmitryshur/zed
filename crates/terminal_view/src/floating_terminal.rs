@@ -1,7 +1,7 @@
 use gpui::{Action, Axis, Entity, EventEmitter, FocusHandle, Focusable, WeakEntity, actions};
 use ui::prelude::*;
 use util::ResultExt;
-use workspace::{FloatingPaneLayer, Item, Pane, Workspace};
+use workspace::{FloatingPaneLayer, Item, Pane, SplitDirection, Workspace};
 
 use crate::{TerminalView, default_working_directory, terminal_panel::build_terminal_pane};
 
@@ -18,6 +18,14 @@ actions!(
         Next,
         /// Focuses the previous floating terminal.
         Previous,
+        /// Focuses the floating terminal to the left of the active one.
+        FocusLeft,
+        /// Focuses the floating terminal below the active one.
+        FocusDown,
+        /// Focuses the floating terminal above the active one.
+        FocusUp,
+        /// Focuses the floating terminal to the right of the active one.
+        FocusRight,
         /// Closes the active floating terminal.
         Close,
         /// Increases the active floating terminal's width by 40 pixels.
@@ -93,6 +101,18 @@ pub(super) fn init(cx: &mut App) {
                 }
             });
         });
+        workspace.register_action(|_, _: &FocusLeft, window, cx| {
+            focus_terminal_in_direction(SplitDirection::Left, window, cx);
+        });
+        workspace.register_action(|_, _: &FocusDown, window, cx| {
+            focus_terminal_in_direction(SplitDirection::Down, window, cx);
+        });
+        workspace.register_action(|_, _: &FocusUp, window, cx| {
+            focus_terminal_in_direction(SplitDirection::Up, window, cx);
+        });
+        workspace.register_action(|_, _: &FocusRight, window, cx| {
+            focus_terminal_in_direction(SplitDirection::Right, window, cx);
+        });
         workspace.register_action(|_, _: &IncreaseWidth, window, cx| {
             resize_terminal(Axis::Horizontal, px(KEYBOARD_GEOMETRY_STEP), window, cx);
         });
@@ -160,6 +180,20 @@ pub(super) fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn focus_terminal_in_direction(
+    direction: SplitDirection,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    cx.defer_in(window, move |workspace, window, cx| {
+        if !workspace.has_active_modal(window, cx) {
+            workspace.floating_panes().clone().update(cx, |layer, cx| {
+                layer.activate_in_direction(direction, window, cx)
+            });
+        }
+    });
 }
 
 fn resize_terminal(axis: Axis, amount: Pixels, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -447,6 +481,10 @@ mod tests {
             gpui::KeyBinding::new("super-right", workspace::ActivateNextPane, Some("Editor")),
             gpui::KeyBinding::new("ctrl-tab", Next, Some(floating_context)),
             gpui::KeyBinding::new("ctrl-shift-tab", Previous, Some(floating_context)),
+            gpui::KeyBinding::new("super-h", FocusLeft, Some(floating_context)),
+            gpui::KeyBinding::new("super-j", FocusDown, Some(floating_context)),
+            gpui::KeyBinding::new("super-k", FocusUp, Some(floating_context)),
+            gpui::KeyBinding::new("super-l", FocusRight, Some(floating_context)),
             gpui::KeyBinding::new("super-right", IncreaseWidth, Some(floating_context)),
             gpui::KeyBinding::new("super-left", DecreaseWidth, Some(floating_context)),
             gpui::KeyBinding::new("super-up", IncreaseHeight, Some(floating_context)),
@@ -470,6 +508,10 @@ mod tests {
             for (keystroke, action) in [
                 ("ctrl-tab", Next.boxed_clone()),
                 ("ctrl-shift-tab", Previous.boxed_clone()),
+                ("super-h", FocusLeft.boxed_clone()),
+                ("super-j", FocusDown.boxed_clone()),
+                ("super-k", FocusUp.boxed_clone()),
+                ("super-l", FocusRight.boxed_clone()),
                 ("super-right", IncreaseWidth.boxed_clone()),
                 ("super-left", DecreaseWidth.boxed_clone()),
                 ("super-up", IncreaseHeight.boxed_clone()),

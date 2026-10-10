@@ -7,7 +7,9 @@ use ui::Tooltip;
 use ui::prelude::*;
 use util::ResultExt;
 
-use crate::{CloseAllItems, ItemHandle, Pane, PaneSearchBarCallbacks, item::ItemEvent, pane};
+use crate::{
+    CloseAllItems, ItemHandle, Pane, PaneSearchBarCallbacks, SplitDirection, item::ItemEvent, pane,
+};
 
 const MAX_FLOATING_PANES: usize = 4;
 
@@ -351,6 +353,52 @@ impl FloatingPaneLayer {
         };
         if let Some(entry) = self.panes.get(next) {
             self.focus_pane(entry.pane.entity_id(), window, cx);
+        }
+    }
+
+    pub fn activate_in_direction(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.visible || self.viewport.width <= px(0.) || self.viewport.height <= px(0.) {
+            return;
+        }
+        let count = self.panes.len();
+        let centers = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let bounds = entry.bounds(self.layout, self.viewport, count, index);
+                (entry.pane.entity_id(), bounds.center())
+            })
+            .collect::<Vec<_>>();
+        let Some(active_center) = centers
+            .iter()
+            .find(|(pane_id, _)| Some(*pane_id) == self.active_pane)
+            .map(|(_, center)| *center)
+        else {
+            return;
+        };
+        // Stacked panes overlap, so the neighbor is the nearest center in that direction rather
+        // than the pane past the active pane's edge.
+        let target = centers
+            .into_iter()
+            .filter_map(|(pane_id, center)| {
+                let offset = center - active_center;
+                let (along, across) = match direction {
+                    SplitDirection::Left => (-offset.x, offset.y),
+                    SplitDirection::Right => (offset.x, offset.y),
+                    SplitDirection::Up => (-offset.y, offset.x),
+                    SplitDirection::Down => (offset.y, offset.x),
+                };
+                (along > px(0.)).then_some((pane_id, along + across.abs()))
+            })
+            .min_by_key(|(_, distance)| *distance);
+        if let Some((pane_id, _)) = target {
+            self.focus_pane(pane_id, window, cx);
         }
     }
 
@@ -1296,6 +1344,60 @@ mod tests {
             assert!(!layer.read(cx).is_visible());
             assert!(original_focus.contains_focused(window, cx));
         });
+    }
+
+    #[gpui::test]
+    async fn floating_panes_activate_in_direction_by_position(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+        let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let layer = workspace.read_with(cx, |workspace, _| workspace.floating_panes().clone());
+        let panes = (0..4)
+            .map(|_| cx.update(|window, cx| add_pane(&workspace, window, cx)))
+            .collect::<Vec<_>>();
+        cx.run_until_parked();
+
+        // Stacked panes cascade down and to the right in creation order, starting from the newest.
+        let stacked_steps = [
+            (SplitDirection::Right, 3),
+            (SplitDirection::Left, 2),
+            (SplitDirection::Up, 1),
+            (SplitDirection::Down, 2),
+            (SplitDirection::Right, 3),
+        ];
+        // Four tiled panes form a 2×2 grid in creation order.
+        let tiled_steps = [
+            (SplitDirection::Up, 1),
+            (SplitDirection::Left, 0),
+            (SplitDirection::Up, 0),
+            (SplitDirection::Down, 2),
+            (SplitDirection::Right, 3),
+            (SplitDirection::Right, 3),
+        ];
+        for (layout, steps) in [
+            (FloatingPaneLayout::Stacked, stacked_steps.as_slice()),
+            (FloatingPaneLayout::Tiled, tiled_steps.as_slice()),
+        ] {
+            if layer.read_with(cx, |layer, _| layer.layout) != layout {
+                layer.update(cx, |layer, cx| layer.toggle_layout(cx));
+            }
+            for &(direction, expected) in steps {
+                cx.update(|window, cx| {
+                    layer.update(cx, |layer, cx| {
+                        layer.activate_in_direction(direction, window, cx)
+                    })
+                });
+                cx.run_until_parked();
+                cx.update(|window, cx| {
+                    assert_eq!(
+                        layer.read(cx).focused_pane(window, cx),
+                        Some(panes[expected].clone()),
+                        "{direction} in the {layout:?} layout"
+                    );
+                });
+            }
+        }
     }
 
     #[gpui::test]
