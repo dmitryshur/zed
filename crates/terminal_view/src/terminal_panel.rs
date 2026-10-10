@@ -2342,7 +2342,7 @@ mod tests {
     use crate::persistence::{
         SerializedAxis, SerializedPane, SerializedPaneGroup, SerializedTabs, serialize_tabs,
     };
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use gpui::{KeyBinding, Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
@@ -3161,6 +3161,48 @@ mod tests {
             assert!(
                 terminal_view.focus_handle(cx).contains_focused(window, cx),
                 "with no modal open, a new task terminal should take focus"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_finished_task_terminal_closes_with_task_finished_binding(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                "ctrl-[",
+                workspace::pane::CloseActiveItem::default(),
+                Some("Terminal && task_finished"),
+            )]);
+        });
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let terminal = terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.add_terminal_task(echo_task(), RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("Failed to spawn a task terminal")
+            .upgrade()
+            .expect("the task terminal should still be open");
+        terminal
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-[");
+        cx.run_until_parked();
+
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            assert_eq!(
+                terminal_panel.active_pane().read(cx).items_len(),
+                0,
+                "ctrl-[ should close the finished task's terminal"
             );
         });
     }

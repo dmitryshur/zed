@@ -1067,6 +1067,17 @@ impl TerminalView {
             dispatch_context.add("vi_mode");
         }
 
+        // A finished task's terminal no longer forwards keys to a process, so keymaps can bind
+        // keys there that a shell would otherwise receive.
+        if self
+            .terminal
+            .read(cx)
+            .task()
+            .is_some_and(|task| task.status != TaskStatus::Running)
+        {
+            dispatch_context.add("task_finished");
+        }
+
         let mode = self.terminal.read(cx).last_content.mode;
         dispatch_context.set(
             "screen",
