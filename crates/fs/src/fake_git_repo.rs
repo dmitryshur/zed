@@ -13,9 +13,9 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
+        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, FileHistoryEntry,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
     stash::GitStash,
@@ -79,6 +79,7 @@ pub struct FakeGitRepositoryState {
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
+    pub file_history: HashMap<RepoPath, Vec<FileHistoryEntry>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub commit_diffs: HashMap<Oid, Arc<git::repository::CommitDiff>>,
     pub commit_diff_read_gate: Option<FakeBlobReadGate>,
@@ -110,6 +111,7 @@ impl FakeGitRepositoryState {
             oids: Default::default(),
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
+            file_history: Default::default(),
             commit_data: Default::default(),
             commit_diffs: Default::default(),
             commit_diff_read_gate: None,
@@ -1772,6 +1774,17 @@ impl GitRepository for FakeGitRepository {
         _commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileHistoryChangedFileSets>>> {
         async move { Ok(vec![FileHistoryChangedFileSets::default(); paths.len()]) }.boxed()
+    }
+
+    fn file_history(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileHistoryEntry>>> {
+        let fs = self.fs.clone();
+        let dot_git_path = self.dot_git_path.clone();
+        async move {
+            fs.with_git_state(&dot_git_path, false, |state| {
+                state.file_history.get(&path).cloned().unwrap_or_default()
+            })
+        }
+        .boxed()
     }
 
     fn commit_data_reader(&self) -> Result<CommitDataReader> {

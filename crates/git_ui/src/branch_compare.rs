@@ -1,10 +1,12 @@
 //! Comparing two branches: pick a base and a compared branch, then browse the files changed on the
-//! compared branch since it split off from the base, one file at a time.
+//! compared branch since it split off from the base, one file at a time. Also compares commits from
+//! one file's history.
 
 mod branch_pair_picker;
 mod compare_diff_view;
 mod compare_list;
 mod comparison;
+mod file_commit_picker;
 mod file_tree;
 
 use anyhow::{Context as _, Result, ensure};
@@ -24,6 +26,7 @@ pub(crate) use compare_list::CompareList;
 use compare_list::VerticalDirection;
 pub(crate) use comparison::{BranchComparison, LocalGitObjects};
 use comparison::{CompareLocation, REMOTE_NOT_SUPPORTED};
+use file_commit_picker::{FileCommitPicker, open_file_comparison};
 
 actions!(
     git,
@@ -33,6 +36,9 @@ actions!(
         CompareBranches,
         /// Shows the current line's blamed commit in the git panel's Compare tab.
         CompareBlameCommit,
+        /// Picks commits that changed the active file and shows how the file differs between two
+        /// of them, or between one of them and the current file.
+        CompareFileCommits,
     ]
 );
 
@@ -69,6 +75,7 @@ actions!(
 pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(compare_branches);
     workspace.register_action(compare_blame_commit);
+    workspace.register_action(compare_file_commits);
     workspace.register_action(|workspace, _: &ActivateCompareTab, window, cx| {
         let Some(panel) = workspace.panel::<GitPanel>(cx) else {
             return;
@@ -298,6 +305,66 @@ fn compare_branches(
                 workspace_handle
                     .update(cx, |workspace, cx| {
                         start_comparison(workspace, repository.clone(), base, compared, window, cx)
+                    })
+                    .ok();
+            },
+            window,
+            cx,
+        )
+    });
+}
+
+fn compare_file_commits(
+    workspace: &mut Workspace,
+    _: &CompareFileCommits,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let project = workspace.project().read(cx);
+    if !project.is_local() {
+        workspace.show_error(REMOTE_NOT_SUPPORTED, cx);
+        return;
+    }
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        workspace.show_error("No file is open", cx);
+        return;
+    };
+    let Some(file) = editor
+        .read(cx)
+        .file_at(editor.read(cx).selections.newest_anchor().head(), cx)
+    else {
+        workspace.show_error("No file is open", cx);
+        return;
+    };
+    let project_path = project::ProjectPath {
+        worktree_id: file.worktree_id(cx),
+        path: file.path().clone(),
+    };
+    let Some((repository, repo_path)) = project
+        .git_store()
+        .read(cx)
+        .repository_and_path_for_project_path(&project_path, cx)
+    else {
+        workspace.show_error("The file isn't in a git repository", cx);
+        return;
+    };
+
+    let workspace_handle = workspace.weak_handle();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        FileCommitPicker::new(
+            repository.clone(),
+            repo_path.clone(),
+            move |comparison, window, cx| {
+                workspace_handle
+                    .update(cx, |workspace, cx| {
+                        open_file_comparison(
+                            workspace,
+                            repository.clone(),
+                            repo_path.clone(),
+                            comparison,
+                            window,
+                            cx,
+                        )
                     })
                     .ok();
             },

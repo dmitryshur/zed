@@ -59,6 +59,13 @@
     },
   },
   {
+    "context": "FileCommitPicker || (FileCommitPicker > Picker > Editor) || (FileCommitPicker > Picker > menu)",
+    "use_key_equivalents": true,
+    "bindings": {
+      "tab": "picker::MultiSelectNext",
+    },
+  },
+  {
     "context": "PullRequestPicker || (PullRequestPicker > Picker > Editor) || (PullRequestPicker > Picker > menu)",
     "use_key_equivalents": true,
     "bindings": {

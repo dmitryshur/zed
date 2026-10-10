@@ -2531,6 +2531,18 @@ impl FakeFs {
         .unwrap();
     }
 
+    pub fn set_file_history_for_repo(
+        &self,
+        dot_git: &Path,
+        path: RepoPath,
+        history: Vec<git::repository::FileHistoryEntry>,
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.file_history.insert(path, history);
+        })
+        .unwrap();
+    }
+
     pub fn set_graph_error(&self, dot_git: &Path, error: Option<String>) {
         self.with_git_state(dot_git, true, |state| {
             state.simulated_graph_error = error;

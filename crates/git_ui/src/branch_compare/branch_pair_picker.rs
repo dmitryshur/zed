@@ -95,15 +95,15 @@ impl Render for BranchPairPicker {
     }
 }
 
-/// The checked branches in the order they were checked, as ref names so they survive filtering.
+/// The checked items in the order they were checked, keyed by name so they survive filtering.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct PairSelection {
-    checked: Vec<SharedString>,
+pub(super) struct PairSelection {
+    pub(super) checked: Vec<SharedString>,
 }
 
 impl PairSelection {
-    /// Unchecks a checked branch, or checks it if fewer than two are checked.
-    fn toggle(&mut self, ref_name: SharedString) {
+    /// Unchecks a checked item, or checks it if fewer than two are checked.
+    pub(super) fn toggle(&mut self, ref_name: SharedString) {
         if let Some(position) = self.checked.iter().position(|checked| checked == &ref_name) {
             self.checked.remove(position);
         } else if self.checked.len() < 2 {
@@ -111,7 +111,7 @@ impl PairSelection {
         }
     }
 
-    fn contains(&self, ref_name: &SharedString) -> bool {
+    pub(super) fn contains(&self, ref_name: &SharedString) -> bool {
         self.checked.contains(ref_name)
     }
 

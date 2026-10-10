@@ -539,6 +539,17 @@ pub struct FileHistoryChangedFileSets {
     pub file_sets: Vec<Vec<RepoPath>>,
 }
 
+/// A commit that changed a file, as listed by `git log --follow`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileHistoryEntry {
+    pub sha: Oid,
+    /// The file's path in this commit, which differs from its current path before a rename.
+    pub path: RepoPath,
+    pub subject: SharedString,
+    pub author_name: SharedString,
+    pub commit_timestamp: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommitFileStatus {
     Added,
@@ -1129,6 +1140,9 @@ pub trait GitRepository: Send + Sync {
         paths: Vec<RepoPath>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileHistoryChangedFileSets>>>;
+
+    /// The commits that changed `path`, newest first, following it across renames.
+    fn file_history(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileHistoryEntry>>>;
 
     fn commit_data_reader(&self) -> Result<CommitDataReader>;
 
@@ -3581,6 +3595,31 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn file_history(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileHistoryEntry>>> {
+        let git = self.git_binary();
+        async move {
+            let output = git
+                .build_command(&[
+                    "log",
+                    "--follow",
+                    "--name-only",
+                    "-z",
+                    "--format=%x1e%H%x00%at%x00%an%x00%s",
+                    "--",
+                    path.as_unix_str(),
+                ])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git log failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_file_history_output(&String::from_utf8_lossy(&output.stdout), &path)
+        }
+        .boxed()
+    }
+
     fn commit_data_reader(&self) -> Result<CommitDataReader> {
         let git_binary = self.git_binary();
 
@@ -3726,6 +3765,36 @@ fn parse_file_history_changed_files_output(
     }
 
     histories
+}
+
+/// Parses records of `\x1e<sha>\0<timestamp>\0<author>\0<subject>\0` followed by the file's
+/// name in that commit.
+fn parse_file_history_output(output: &str, path: &RepoPath) -> Result<Vec<FileHistoryEntry>> {
+    // A record without a name (a merge commit) keeps the path of the newer commit before it.
+    let mut current_path = path.clone();
+    let mut entries = Vec::new();
+    for record in output.split('\x1e').filter(|record| !record.is_empty()) {
+        let mut fields = record.split('\0');
+        let (Some(sha), Some(timestamp), Some(author_name), Some(subject)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            anyhow::bail!("unexpected git log output: {record:?}");
+        };
+        if let Some(name) = fields
+            .map(|field| field.trim_start_matches('\n'))
+            .find(|field| !field.is_empty())
+        {
+            current_path = RepoPath::new(name)?;
+        }
+        entries.push(FileHistoryEntry {
+            sha: sha.parse()?,
+            path: current_path.clone(),
+            subject: subject.to_string().into(),
+            author_name: author_name.to_string().into(),
+            commit_timestamp: timestamp.parse()?,
+        });
+    }
+    Ok(entries)
 }
 
 fn parse_initial_graph_output<'a>(
@@ -4694,6 +4763,53 @@ mod tests {
             assert_eq!(object.is_binary, expected_binary);
             assert_eq!(object.content, bytes);
         }
+    }
+
+    #[gpui::test]
+    async fn test_file_history_follows_renames(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("failed to create temporary repository");
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("old.txt"), "one\n").expect("failed to write old.txt");
+        fs::write(repo_dir.path().join("other.txt"), "other\n").expect("failed to write other.txt");
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "add old"]);
+        git_command(repo_dir.path(), ["mv", "old.txt", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "rename"]);
+        fs::write(repo_dir.path().join("other.txt"), "changed\n")
+            .expect("failed to write other.txt");
+        git_command(repo_dir.path(), ["commit", "-am", "edit other"]);
+        fs::write(repo_dir.path().join("new.txt"), "one\ntwo\n").expect("failed to write new.txt");
+        git_command(repo_dir.path(), ["commit", "-am", "edit new"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("failed to open repository");
+        let history = repository
+            .file_history(RepoPath::new("new.txt").unwrap())
+            .await
+            .expect("failed to load file history");
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| (entry.subject.as_ref(), entry.path.as_unix_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("edit new", "new.txt"),
+                ("rename", "new.txt"),
+                ("add old", "old.txt"),
+            ]
+        );
+        let head = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        assert_eq!(history[0].sha.to_string(), head.trim());
+        assert!(history.iter().all(|entry| entry.commit_timestamp > 0));
     }
 
     #[gpui::test]

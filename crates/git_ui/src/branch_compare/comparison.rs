@@ -7,7 +7,8 @@ use file_content::decode_text;
 use git::{
     Oid,
     repository::{
-        Branch, CommitDetails, CommitFileStatus, GitRepository, RepoPath, is_binary_content,
+        Branch, CommitDetails, CommitFileStatus, FileHistoryEntry, GitRepository, RepoPath,
+        is_binary_content,
     },
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
 };
@@ -104,11 +105,30 @@ impl LocalGitObjects {
         })
     }
 
+    /// The blob of a file at a commit, or `None` when the file doesn't exist there.
+    pub(crate) async fn blob_at(&self, commit: Oid, path: &RepoPath) -> Result<Option<Oid>> {
+        let blob = self
+            .backend
+            .revparse_batch(vec![format!("{commit}:{}", path.as_unix_str())])
+            .await?
+            .into_iter()
+            .next()
+            .flatten();
+        match blob {
+            Some(sha) => Ok(Some(sha.parse()?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn file_history(&self, path: RepoPath) -> Result<Vec<FileHistoryEntry>> {
+        self.backend.file_history(path).await
+    }
+
     async fn diff_tree(&self, request: DiffTreeType) -> Result<TreeDiff> {
         self.backend.diff_tree(request).await
     }
 
-    async fn load_texts(
+    pub(crate) async fn load_texts(
         &self,
         old_blob: Option<Oid>,
         new_revision: Option<String>,
@@ -666,56 +686,14 @@ impl BranchComparison {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<LoadedCompareFile>> {
-        let repo_path = entry.repo_path.clone();
-        let Some(project_path) = self
-            .repository
-            .read(cx)
-            .repo_path_to_project_path(&repo_path, cx)
-        else {
-            return Task::ready(Err(anyhow!(
-                "{} is outside of the project",
-                repo_path.display(PathStyle::local())
-            )));
-        };
-        let project = self.project.clone();
-        let repository = self.repository.clone();
-        let old_side = entry.old_side;
-        window.spawn(cx, async move |cx| {
-            let buffer = project
-                .update(cx, |project, cx| project.open_buffer(project_path, cx))
-                .await?;
-            let diff = match old_side {
-                OldSide::Blob(oid) => {
-                    let git_store = project.read_with(cx, |project, _| project.git_store().clone());
-                    git_store
-                        .update(cx, |git_store, cx| {
-                            git_store.open_diff_since(Some(oid), buffer.clone(), repository, cx)
-                        })
-                        .await?
-                }
-                OldSide::Absent => {
-                    let git_store = project.read_with(cx, |project, _| project.git_store().clone());
-                    git_store
-                        .update(cx, |git_store, cx| {
-                            git_store.open_diff_since(None, buffer.clone(), repository, cx)
-                        })
-                        .await?
-                }
-                OldSide::Unknown => {
-                    project
-                        .update(cx, |project, cx| {
-                            project.open_uncommitted_diff(buffer.clone(), cx)
-                        })
-                        .await?
-                }
-            };
-            Ok(LoadedCompareFile {
-                repo_path,
-                buffer,
-                diff,
-                read_only: false,
-            })
-        })
+        open_working_tree_file(
+            self.project.clone(),
+            self.repository.clone(),
+            entry.repo_path.clone(),
+            entry.old_side,
+            window,
+            cx,
+        )
     }
 
     fn load_committed_file(
@@ -762,66 +740,142 @@ impl BranchComparison {
                 )
             }
         };
-        let project = self.project.clone();
-        let repository = self.repository.clone();
-        let language_registry = project.read(cx).languages().clone();
-        window.spawn(cx, async move |cx| {
-            let texts = texts.await?;
-            let is_binary = matches!(texts.old, Some(FileText::Binary))
-                || matches!(texts.new, Some(FileText::Binary));
-            let text = |file_text: Option<FileText>| match file_text {
-                Some(FileText::Text(text)) => Some(text),
-                Some(FileText::Binary) | None => None,
-            };
-            let (old_text, new_text) = if is_binary {
-                (None, "(binary file not shown)".to_string())
-            } else {
-                (text(texts.old), text(texts.new).unwrap_or_default())
-            };
-
-            let worktree_id = repository
-                .read_with(cx, |repository, cx| {
-                    worktree_id_for_repo_path(repository, project.read(cx), &repo_path, cx)
-                })
-                .context("project has no worktrees")?;
-            let display_name = repo_path
-                .file_name()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| repo_path.display(PathStyle::local()).to_string());
-            let blob = Arc::new(GitBlob {
-                path: repo_path.clone(),
-                worktree_id,
-                is_deleted,
-                is_binary,
-                display_name,
-            }) as Arc<dyn language::File>;
-            let buffer = build_buffer(new_text, blob, &language_registry, cx).await?;
-            buffer.update(cx, |buffer, cx| {
-                buffer.set_capability(Capability::ReadOnly, cx)
-            });
-            let diff = if is_binary {
-                cx.update(|_, cx| {
-                    let snapshot = buffer.read(cx).snapshot();
-                    cx.new(|cx| {
-                        BufferDiff::new_unchanged(
-                            &snapshot,
-                            snapshot.language().cloned(),
-                            Some(language_registry.clone()),
-                            cx,
-                        )
-                    })
-                })?
-            } else {
-                build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
-            };
-            Ok(LoadedCompareFile {
-                repo_path,
-                buffer,
-                diff,
-                read_only: true,
-            })
-        })
+        build_committed_file(
+            self.project.clone(),
+            self.repository.clone(),
+            repo_path,
+            is_deleted,
+            texts,
+            window,
+            cx,
+        )
     }
+}
+
+/// Opens the working-tree buffer of `repo_path` with its diff against `old_side`. The buffer is the
+/// project's own, so it stays editable.
+pub(crate) fn open_working_tree_file(
+    project: Entity<Project>,
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    old_side: OldSide,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<LoadedCompareFile>> {
+    let Some(project_path) = repository
+        .read(cx)
+        .repo_path_to_project_path(&repo_path, cx)
+    else {
+        return Task::ready(Err(anyhow!(
+            "{} is outside of the project",
+            repo_path.display(PathStyle::local())
+        )));
+    };
+    window.spawn(cx, async move |cx| {
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await?;
+        let diff = match old_side {
+            OldSide::Blob(oid) => {
+                let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+                git_store
+                    .update(cx, |git_store, cx| {
+                        git_store.open_diff_since(Some(oid), buffer.clone(), repository, cx)
+                    })
+                    .await?
+            }
+            OldSide::Absent => {
+                let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+                git_store
+                    .update(cx, |git_store, cx| {
+                        git_store.open_diff_since(None, buffer.clone(), repository, cx)
+                    })
+                    .await?
+            }
+            OldSide::Unknown => {
+                project
+                    .update(cx, |project, cx| {
+                        project.open_uncommitted_diff(buffer.clone(), cx)
+                    })
+                    .await?
+            }
+        };
+        Ok(LoadedCompareFile {
+            repo_path,
+            buffer,
+            diff,
+            read_only: false,
+        })
+    })
+}
+
+/// Builds a read-only buffer from texts loaded out of git, diffed against the old text.
+pub(crate) fn build_committed_file(
+    project: Entity<Project>,
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    is_deleted: bool,
+    texts: Task<Result<FileTexts>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<LoadedCompareFile>> {
+    let language_registry = project.read(cx).languages().clone();
+    window.spawn(cx, async move |cx| {
+        let texts = texts.await?;
+        let is_binary = matches!(texts.old, Some(FileText::Binary))
+            || matches!(texts.new, Some(FileText::Binary));
+        let text = |file_text: Option<FileText>| match file_text {
+            Some(FileText::Text(text)) => Some(text),
+            Some(FileText::Binary) | None => None,
+        };
+        let (old_text, new_text) = if is_binary {
+            (None, "(binary file not shown)".to_string())
+        } else {
+            (text(texts.old), text(texts.new).unwrap_or_default())
+        };
+
+        let worktree_id = repository
+            .read_with(cx, |repository, cx| {
+                worktree_id_for_repo_path(repository, project.read(cx), &repo_path, cx)
+            })
+            .context("project has no worktrees")?;
+        let display_name = repo_path
+            .file_name()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| repo_path.display(PathStyle::local()).to_string());
+        let blob = Arc::new(GitBlob {
+            path: repo_path.clone(),
+            worktree_id,
+            is_deleted,
+            is_binary,
+            display_name,
+        }) as Arc<dyn language::File>;
+        let buffer = build_buffer(new_text, blob, &language_registry, cx).await?;
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_capability(Capability::ReadOnly, cx)
+        });
+        let diff = if is_binary {
+            cx.update(|_, cx| {
+                let snapshot = buffer.read(cx).snapshot();
+                cx.new(|cx| {
+                    BufferDiff::new_unchanged(
+                        &snapshot,
+                        snapshot.language().cloned(),
+                        Some(language_registry.clone()),
+                        cx,
+                    )
+                })
+            })?
+        } else {
+            build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
+        };
+        Ok(LoadedCompareFile {
+            repo_path,
+            buffer,
+            diff,
+            read_only: true,
+        })
+    })
 }
 
 fn pull_request_title(number: u64, title: &str) -> SharedString {
