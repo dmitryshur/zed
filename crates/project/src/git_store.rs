@@ -1118,9 +1118,45 @@ impl GitStore {
     }
 
     pub fn set_active_repo_for_path(&mut self, project_path: &ProjectPath, cx: &mut Context<Self>) {
-        if let Some((repo, _)) = self.repository_and_path_for_project_path(project_path, cx) {
-            self.set_active_repo_id(repo.read(cx).id, cx);
+        let Some((repo, _)) = self.repository_and_path_for_project_path(project_path, cx) else {
+            return;
+        };
+        // A repository kept in a gitignored folder of another repository (e.g. personal
+        // notes inside a work checkout) isn't part of the project being worked on, so
+        // focusing its files shouldn't switch away from the current repository.
+        if self.is_nested_in_ignored_folder(&repo, project_path.worktree_id, cx) {
+            return;
         }
+        self.set_active_repo_id(repo.read(cx).id, cx);
+    }
+
+    fn is_nested_in_ignored_folder(
+        &self,
+        repository: &Entity<Repository>,
+        worktree_id: WorktreeId,
+        cx: &App,
+    ) -> bool {
+        let Some(worktree) = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
+        else {
+            return false;
+        };
+        let worktree = worktree.read(cx);
+        let work_directory = &repository.read(cx).work_directory_abs_path;
+        let is_ignored = worktree
+            .path_style()
+            .strip_prefix(work_directory, &worktree.abs_path())
+            .filter(|relative_path| !relative_path.is_empty())
+            .and_then(|relative_path| worktree.entry_for_path(&relative_path))
+            .is_some_and(|entry| entry.is_ignored);
+        is_ignored
+            && self.repositories.values().any(|other_repository| {
+                let other_work_directory = &other_repository.read(cx).work_directory_abs_path;
+                other_work_directory != work_directory
+                    && work_directory.starts_with(other_work_directory)
+            })
     }
 
     pub fn set_active_repo_for_worktree(

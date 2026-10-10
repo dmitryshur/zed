@@ -2435,6 +2435,86 @@ mod repository_activation_tests {
     }
 
     #[gpui::test]
+    async fn test_ignored_nested_repository_does_not_become_active(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = build_project(
+            cx,
+            json!({
+                ".git": {},
+                ".gitignore": "logs\n",
+                "src": {
+                    "main.rs": ""
+                },
+                "logs": {
+                    ".git": {},
+                    "notes.md": ""
+                },
+                "vendor": {
+                    "lib": {
+                        ".git": {},
+                        "lib.rs": ""
+                    }
+                }
+            }),
+        )
+        .await;
+
+        // Ignored folders are scanned lazily, so the nested repository is only
+        // discovered once one of its files is opened.
+        project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/logs/notes.md"), cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+        assert_repositories(
+            &project,
+            cx,
+            &[
+                path!("/root"),
+                path!("/root/logs"),
+                path!("/root/vendor/lib"),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            activate_repository_for_path(&project, "src/main.rs", cx),
+            Path::new(path!("/root"))
+        );
+        assert_eq!(
+            activate_repository_for_path(&project, "logs/notes.md", cx),
+            Path::new(path!("/root"))
+        );
+        assert_eq!(
+            activate_repository_for_path(&project, "vendor/lib/lib.rs", cx),
+            Path::new(path!("/root/vendor/lib"))
+        );
+        assert_eq!(
+            activate_repository_for_path(&project, "logs/notes.md", cx),
+            Path::new(path!("/root/vendor/lib"))
+        );
+
+        let logs_repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .find(|repository| {
+                    repository.read(cx).work_directory_abs_path.as_ref()
+                        == Path::new(path!("/root/logs"))
+                })
+                .unwrap()
+                .clone()
+        });
+        logs_repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        assert_eq!(
+            activate_repository_for_path(&project, "logs/notes.md", cx),
+            Path::new(path!("/root/logs"))
+        );
+    }
+
+    #[gpui::test]
     async fn test_active_repository_survives_file_scan_depth_tightening(cx: &mut TestAppContext) {
         init_test(cx);
         set_file_scan_depth(cx, 0);
@@ -2597,6 +2677,28 @@ mod repository_activation_tests {
                 .map(PathBuf::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn activate_repository_for_path(
+        project: &Entity<Project>,
+        path: &str,
+        cx: &mut TestAppContext,
+    ) -> PathBuf {
+        project.update(cx, |project, cx| {
+            let project_path = ProjectPath {
+                worktree_id: project.worktrees(cx).next().unwrap().read(cx).id(),
+                path: rel_path(path).into(),
+            };
+            project.git_store().update(cx, |git_store, cx| {
+                git_store.set_active_repo_for_path(&project_path, cx);
+            });
+            project
+                .active_repository(cx)
+                .unwrap()
+                .read(cx)
+                .work_directory_abs_path
+                .to_path_buf()
+        })
     }
 
     fn set_file_scan_depth(cx: &mut TestAppContext, depth: u32) {
