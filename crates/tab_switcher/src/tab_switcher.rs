@@ -13,7 +13,7 @@ use gpui::{
     Render, Styled, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate};
-use project::Project;
+use project::{Project, ProjectPath};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::Settings;
@@ -26,7 +26,7 @@ use ui::{
 use util::ResultExt;
 use workspace::{
     Event as WorkspaceEvent, ModalView, Pane, SaveIntent, Workspace,
-    item::{ItemHandle, ItemSettings, ShowDiagnostics, TabContentParams},
+    item::{ItemBufferKind, ItemHandle, ItemSettings, ShowDiagnostics, TabContentParams},
     pane::{render_item_indicator, tab_details},
 };
 
@@ -363,6 +363,15 @@ impl TabMatch {
     }
 }
 
+/// The file whose tabs in different panes count as one tab. A multibuffer reports the file under
+/// its cursor as its path, but it is a separate tab from that file's own.
+fn file_path(item: &dyn ItemHandle, cx: &App) -> Option<ProjectPath> {
+    if item.buffer_kind(cx) == ItemBufferKind::Multibuffer {
+        return None;
+    }
+    item.project_path(cx)
+}
+
 impl TabSwitcherDelegate {
     #[allow(clippy::complexity)]
     fn new(
@@ -482,9 +491,9 @@ impl TabSwitcherDelegate {
         };
 
         if self.open_in_active_pane {
-            let mut seen_paths: HashSet<project::ProjectPath> = HashSet::default();
+            let mut seen_paths: HashSet<ProjectPath> = HashSet::default();
             matches.retain(|tab| {
-                if let Some(path) = tab.item.project_path(cx) {
+                if let Some(path) = file_path(tab.item.as_ref(), cx) {
                     seen_paths.insert(path)
                 } else {
                     true
@@ -609,7 +618,7 @@ impl TabSwitcherDelegate {
         };
 
         if self.open_in_active_pane
-            && let Some(project_path) = tab_match.item.project_path(cx)
+            && let Some(project_path) = file_path(tab_match.item.as_ref(), cx)
         {
             let Some(workspace) = self.workspace.upgrade() else {
                 return;

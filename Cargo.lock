@@ -17765,6 +17765,7 @@ dependencies = [
  "editor",
  "fuzzy_nucleo",
  "gpui",
+ "language",
  "menu",
  "picker",
  "picker_preview",

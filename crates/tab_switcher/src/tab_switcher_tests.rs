@@ -1,6 +1,7 @@
 use super::*;
-use editor::{Editor, MultiBufferOffset, SelectionEffects};
+use editor::{Editor, MultiBuffer, MultiBufferOffset, PathKey, SelectionEffects};
 use gpui::{TestAppContext, VisualTestContext};
+use language::{Capability, Point};
 use menu::SelectPrevious;
 use project::{Project, ProjectPath};
 use serde_json::json;
@@ -908,6 +909,74 @@ async fn test_open_in_active_pane_closes_file_in_all_panes(cx: &mut gpui::TestAp
             "all panes should be empty"
         );
     }
+}
+
+#[gpui::test]
+async fn test_open_in_active_pane_keeps_files_shown_in_multibuffers(cx: &mut gpui::TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({"1.txt": "one\ntwo\n"}))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let file = open_buffer("1.txt", &workspace, cx).await;
+    let buffer = cx.read(|cx| {
+        let editor = file.act_as::<Editor>(cx).unwrap();
+        editor.read(cx).buffer().read(cx).as_singleton().unwrap()
+    });
+    // Like Find All References: a multibuffer whose cursor is in a file that is also open.
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            buffer,
+            [Point::new(0, 0)..Point::new(1, 0)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+    let references = cx.new_window_entity(|window, cx| {
+        Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx)
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(references.clone()), None, true, window, cx);
+    });
+
+    let tab_switcher = open_tab_switcher_for_active_pane(&workspace, cx);
+    tab_switcher.update(cx, |picker, _| {
+        let listed = picker
+            .delegate
+            .matches
+            .iter()
+            .map(|tab| tab.item.item_id())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, vec![references.entity_id(), file.item_id()]);
+        picker.delegate.selected_index = 0;
+    });
+
+    cx.dispatch_action(CloseSelectedItem);
+    cx.run_until_parked();
+
+    let open_items = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .active_pane()
+            .read(cx)
+            .items()
+            .map(|item| item.item_id())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        open_items,
+        vec![file.item_id()],
+        "closing the multibuffer should leave the file open"
+    );
 }
 
 #[gpui::test]
